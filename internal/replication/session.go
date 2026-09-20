@@ -25,8 +25,9 @@ const (
 	closeTimeout       = 5 * time.Second
 
 	// While a chunk waits for its delivery to be noticed, the owner loop must not sit in Receive
-	// until the next feedback deadline, or every chunk on a quiet stream would take that long.
-	chunkPollInterval = 5 * time.Millisecond
+	// until the next feedback deadline, or every chunk on a quiet stream would take that long. At
+	// 5ms this poll alone was a fifth of a chunk's cycle; it only runs while a chunk is awaited.
+	chunkPollInterval = time.Millisecond
 )
 
 var (
@@ -519,6 +520,11 @@ func (s *session) emitReads() error {
 	}
 	if s.cur.Dirty() || !s.ledger.AdvanceIdle(r.lsn) {
 		s.cur.AckLSN = r.lsn
+	}
+	// The end of a chunk is a flush point: the worker sends nothing more until this batch is
+	// delivered, so lingering for more events would only add the linger to every chunk.
+	if s.sealable() {
+		s.seal()
 	}
 	s.tracker.prune(r.chunk.xmin)
 	s.awaited = &awaitedChunk{lsn: r.lsn, result: chunkResult{

@@ -32,6 +32,17 @@ func (s *session) feed(t *testing.T, payloads ...[]byte) {
 	}
 }
 
+// takeSealed returns the batch a finished merge sealed, the way the loop would hand it to the queue.
+func (s *session) takeSealed(t *testing.T) *event.Batch {
+	t.Helper()
+	if s.pending == nil {
+		t.Fatal("the merge did not seal its last batch")
+	}
+	b := s.pending
+	s.pending = nil
+	return b
+}
+
 func markerMsg(t *testing.T, lsn pglogrepl.LSN, m marker) []byte {
 	t.Helper()
 	content, err := json.Marshal(m)
@@ -79,24 +90,25 @@ func TestSession_mergesChunkAtItsMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reads := s.cur.Records[streamed:]
+	b := s.takeSealed(t)
+	reads := b.Records[streamed:]
 	var ids []string
 	for _, rec := range reads {
 		if rec.Op != event.OpRead {
 			t.Fatalf("record op = %q, want read", rec.Op)
 		}
-		ids = append(ids, string(s.cur.Key(rec)))
+		ids = append(ids, string(b.Key(rec)))
 	}
 	if got, want := strings.Join(ids, " "), `{"id":3} {"id":4}`; got != want {
 		t.Fatalf("emitted reads = %s, want %s: row 1 has a complete newer image, row 2 only a patch", got, want)
 	}
-	if s.cur.AckLSN != markerLSN {
-		t.Fatalf("batch ack = %s, want the marker's LSN %s", s.cur.AckLSN, markerLSN)
+	if b.AckLSN != markerLSN {
+		t.Fatalf("batch ack = %s, want the marker's LSN %s", b.AckLSN, markerLSN)
 	}
 	if a := s.awaited; a == nil || a.result.emitted != 2 || len(a.result.retry) != 1 || a.result.retry[0][0] != "2" {
 		t.Fatalf("awaited = %+v, want 2 emitted and key 2 to be read again", a)
 	}
-	value := string(s.cur.Value(reads[0]))
+	value := string(b.Value(reads[0]))
 	if strings.Contains(value, "commit_lsn") || !strings.Contains(value, `"backfill":"16384.0/1F4"`) {
 		t.Fatalf("read event must be named after its table and marker LSN, and carry no commit_lsn: %s", value)
 	}
@@ -158,8 +170,8 @@ func TestSession_chunkSpansBatchesAndOnlyTheLastIsAcked(t *testing.T) {
 	if err := s.emitReads(); err != nil {
 		t.Fatal(err)
 	}
-	if s.reads != nil || s.cur.AckLSN != markerLSN {
-		t.Fatalf("last batch: reads=%v ack=%s, want the merge finished and acked at %s", s.reads, s.cur.AckLSN, markerLSN)
+	if last := s.takeSealed(t); s.reads != nil || last.AckLSN != markerLSN {
+		t.Fatalf("last batch: reads=%v ack=%s, want the merge finished and acked at %s", s.reads, last.AckLSN, markerLSN)
 	}
 }
 
@@ -231,6 +243,7 @@ func TestSession_keyMoveHoldsTheAckUntilItsRowIsReadAgain(t *testing.T) {
 	if a := s.awaited; a == nil || len(a.result.moves) != 1 || string(a.result.moves[0].key) != `{"id":9}` || a.result.moves[0].table != "public.users" {
 		t.Fatalf("awaited = %+v, want the moved key handed to the worker with its table", a)
 	}
+	s.ledger.Done(s.takeSealed(t).Seq)
 	s.reportChunk()
 	if got := s.ledger.Flushed(); got != 300 {
 		t.Fatalf("reported position = %s, the hold was lifted before the row was read again", got)
@@ -242,8 +255,7 @@ func TestSession_keyMoveHoldsTheAckUntilItsRowIsReadAgain(t *testing.T) {
 	if err := s.emitReads(); err != nil {
 		t.Fatal(err)
 	}
-	s.cur.Seq = s.ledger.Add(s.cur.AckLSN, len(s.cur.Buf))
-	s.ledger.Done(s.cur.Seq)
+	s.ledger.Done(s.takeSealed(t).Seq)
 	s.reportChunk()
 	if got := s.ledger.Flushed(); got < 600 {
 		t.Fatalf("reported position = %s, want the hold released once the moved row was delivered", got)
@@ -290,8 +302,8 @@ func (s *session) reads0ID(t *testing.T) string {
 	var ev struct {
 		Backfill string `json:"backfill"`
 	}
-	last := s.cur.Records[len(s.cur.Records)-1]
-	if err := json.Unmarshal(s.cur.Value(last), &ev); err != nil {
+	b := s.takeSealed(t)
+	if err := json.Unmarshal(b.Value(b.Records[len(b.Records)-1]), &ev); err != nil {
 		t.Fatal(err)
 	}
 	return ev.Backfill
