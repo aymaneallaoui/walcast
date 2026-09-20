@@ -10,6 +10,8 @@ import (
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/rs/zerolog"
+
+	"github.com/aymaneallaoui/walcast/internal/config"
 )
 
 const (
@@ -102,29 +104,82 @@ func qualified(tables []string) []string {
 	return out
 }
 
-// ensureSlot creates the slot only when allowCreate is set. A slot that vanishes between sessions
-// must not be recreated silently: the new one would start past every change made in between.
-func ensureSlot(ctx context.Context, conn *pgconn.PgConn, log zerolog.Logger, name string, allowCreate bool) error {
+// bootstrapSlot runs once per process. The state table outlives the slot, so a slot that vanished
+// while walcast was down is refused instead of being recreated past every change made since.
+func bootstrapSlot(ctx context.Context, conn *pgconn.PgConn, log zerolog.Logger, cfg config.Config) error {
+	if err := ensureStateTable(ctx, conn, cfg.StateSchema); err != nil {
+		return err
+	}
+	state, err := loadSlotState(ctx, conn, cfg.StateSchema, cfg.SlotName)
+	if err != nil {
+		return err
+	}
+	exists, err := checkSlot(ctx, conn, cfg.SlotName)
+	if err != nil {
+		return err
+	}
+
+	switch {
+	case exists:
+	case !state.known:
+		if err := createSlot(ctx, conn, log, cfg.SlotName); err != nil {
+			return err
+		}
+	case cfg.SlotRecreateGeneration != state.generation+1:
+		return fmt.Errorf("%w: %w: %s is gone and the changes made since are not recoverable; set SLOT_RECREATE_GENERATION=%d to accept the gap and recreate it",
+			ErrSlotUnusable, ErrSlotLost, cfg.SlotName, state.generation+1)
+	default:
+		// The generation is bumped before the slot exists: a crash in between then refuses the
+		// same flag value, where the other order would let it recreate the slot a second time.
+		if err := recordRecreation(ctx, conn, cfg.StateSchema, cfg.SlotName, cfg.SlotRecreateGeneration); err != nil {
+			return err
+		}
+		if err := createSlot(ctx, conn, log, cfg.SlotName); err != nil {
+			return err
+		}
+		log.Error().Str("slot", cfg.SlotName).Int("generation", cfg.SlotRecreateGeneration).
+			Msg("lost replication slot recreated on request, changes made while it was gone are skipped")
+	}
+
+	if state.known {
+		return nil
+	}
+	return recordSlot(ctx, conn, cfg.StateSchema, cfg.SlotName, cfg.PublicationName)
+}
+
+// requireSlot guards reconnects: a slot that vanishes between sessions is never recreated.
+func requireSlot(ctx context.Context, conn *pgconn.PgConn, name string) error {
+	exists, err := checkSlot(ctx, conn, name)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("%w: %s disappeared while walcast was running", ErrSlotUnusable, name)
+	}
+	return nil
+}
+
+func checkSlot(ctx context.Context, conn *pgconn.PgConn, name string) (bool, error) {
 	rows, err := query(ctx, conn, fmt.Sprintf(
 		"SELECT plugin, COALESCE(wal_status, '') FROM pg_replication_slots WHERE slot_name = '%s'", name))
 	if err != nil {
-		return fmt.Errorf("check slot: %w", err)
+		return false, fmt.Errorf("check slot: %w", err)
 	}
-	if len(rows) > 0 {
-		plugin, walStatus := string(rows[0][0]), string(rows[0][1])
-		if plugin != outputPlugin {
-			return fmt.Errorf("%w: %s uses plugin %q, want %s", ErrSlotUnusable, name, plugin, outputPlugin)
-		}
-		if walStatus == "lost" {
-			return fmt.Errorf("%w: %s was invalidated, its WAL is gone", ErrSlotUnusable, name)
-		}
-		return nil
+	if len(rows) == 0 {
+		return false, nil
 	}
-	if !allowCreate {
-		return fmt.Errorf("%w: %s disappeared while walcast was running", ErrSlotUnusable, name)
+	plugin, walStatus := string(rows[0][0]), string(rows[0][1])
+	if plugin != outputPlugin {
+		return false, fmt.Errorf("%w: %s uses plugin %q, want %s", ErrSlotUnusable, name, plugin, outputPlugin)
 	}
+	if walStatus == "lost" {
+		return false, fmt.Errorf("%w: %s was invalidated, its WAL is gone", ErrSlotUnusable, name)
+	}
+	return true, nil
+}
 
-	_, err = pglogrepl.CreateReplicationSlot(ctx, conn, name, outputPlugin, pglogrepl.CreateReplicationSlotOptions{
+func createSlot(ctx context.Context, conn *pgconn.PgConn, log zerolog.Logger, name string) error {
+	_, err := pglogrepl.CreateReplicationSlot(ctx, conn, name, outputPlugin, pglogrepl.CreateReplicationSlotOptions{
 		Mode:           pglogrepl.LogicalReplication,
 		SnapshotAction: "NOEXPORT_SNAPSHOT",
 	})

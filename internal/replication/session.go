@@ -68,10 +68,9 @@ func (r *Runner) Run(ctx context.Context) (pglogrepl.LSN, error) {
 	if err := ensurePublication(ctx, conn, r.log, r.cfg.PublicationName, r.cfg.PublicationTables); err != nil {
 		return 0, err
 	}
-	if err := ensureSlot(ctx, conn, r.log, r.cfg.SlotName, !r.established); err != nil {
+	if err := r.ensureSlot(ctx, conn); err != nil {
 		return 0, err
 	}
-	r.established = true
 	if err := startReplication(ctx, conn, r.cfg.SlotName, r.cfg.PublicationName); err != nil {
 		return 0, err
 	}
@@ -80,6 +79,17 @@ func (r *Runner) Run(ctx context.Context) (pglogrepl.LSN, error) {
 	s := newSession(r.cfg, r.log, pgStream{conn})
 	r.lastDispatch = s.dispatched
 	return s.run(ctx, r.sink)
+}
+
+func (r *Runner) ensureSlot(ctx context.Context, conn *pgconn.PgConn) error {
+	if r.established {
+		return requireSlot(ctx, conn, r.cfg.SlotName)
+	}
+	if err := bootstrapSlot(ctx, conn, r.log, r.cfg); err != nil {
+		return err
+	}
+	r.established = true
+	return nil
 }
 
 // awaitLastDispatcher keeps two sessions from using the sink concurrently when the previous
@@ -127,12 +137,14 @@ type session struct {
 
 func newSession(cfg config.Config, log zerolog.Logger, st stream) *session {
 	now := time.Now()
+	enc := event.NewEncoder()
+	enc.IgnoreSchema(cfg.StateSchema)
 	return &session{
 		cfg:           cfg,
 		log:           log,
 		stream:        st,
 		ledger:        ledger.New(0),
-		enc:           event.NewEncoder(),
+		enc:           enc,
 		queue:         make(chan *event.Batch, queueCap),
 		dispatched:    make(chan struct{}),
 		cur:           event.NewBatch(),

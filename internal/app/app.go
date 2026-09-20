@@ -70,6 +70,7 @@ func (a *App) Run(ctx context.Context) error {
 func isFatal(err error) bool {
 	return errors.Is(err, replication.ErrSlotUnusable) ||
 		errors.Is(err, replication.ErrSinkStuck) ||
+		errors.Is(err, replication.ErrStateStore) ||
 		errors.Is(err, event.ErrUnencodable) ||
 		errors.Is(err, sink.ErrRejected)
 }
