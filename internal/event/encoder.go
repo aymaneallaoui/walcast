@@ -15,7 +15,8 @@ const (
 	opDelete   = "delete"
 	opTruncate = "truncate"
 
-	columnFlagKey = 1
+	columnFlagKey       = 1
+	replicaIdentityFull = 'f'
 )
 
 // ErrUnencodable marks deterministic failures: replaying the same WAL fails the same way.
@@ -29,7 +30,9 @@ type column struct {
 }
 
 type relation struct {
+	name  string
 	table []byte
+	keyed bool
 	cols  []column
 }
 
@@ -40,6 +43,7 @@ type Encoder struct {
 	seq       uint64
 	ts        []byte
 	unchanged [][]byte
+	recStart  int
 }
 
 func NewEncoder() *Encoder {
@@ -47,8 +51,10 @@ func NewEncoder() *Encoder {
 }
 
 func (e *Encoder) Relation(m *pglogrepl.RelationMessage) {
+	name := m.Namespace + "." + m.RelationName
 	rel := &relation{
-		table: appendString(nil, []byte(m.Namespace+"."+m.RelationName)),
+		name:  name,
+		table: appendString(nil, []byte(name)),
 		cols:  make([]column, len(m.Columns)),
 	}
 	for i, c := range m.Columns {
@@ -59,7 +65,9 @@ func (e *Encoder) Relation(m *pglogrepl.RelationMessage) {
 			oid:   c.DataType,
 			isKey: c.Flags&columnFlagKey != 0,
 		}
+		rel.keyed = rel.keyed || rel.cols[i].isKey
 	}
+	rel.keyed = rel.keyed && m.ReplicaIdentity != replicaIdentityFull
 	e.rels[m.RelationID] = rel
 }
 
@@ -79,7 +87,7 @@ func (e *Encoder) Insert(b *Batch, lsn pglogrepl.LSN, m *pglogrepl.InsertMessage
 	if err := e.tuple(b, rel, ",\"new\":", m.Tuple, false); err != nil {
 		return err
 	}
-	e.footer(b)
+	e.footer(b, rel, m.Tuple)
 	return nil
 }
 
@@ -98,7 +106,7 @@ func (e *Encoder) Update(b *Batch, lsn pglogrepl.LSN, m *pglogrepl.UpdateMessage
 	if err := e.tuple(b, rel, ",\"new\":", m.NewTuple, false); err != nil {
 		return err
 	}
-	e.footer(b)
+	e.footer(b, rel, m.NewTuple)
 	return nil
 }
 
@@ -112,7 +120,7 @@ func (e *Encoder) Delete(b *Batch, lsn pglogrepl.LSN, m *pglogrepl.DeleteMessage
 	if err := e.tuple(b, rel, ",\"old\":", m.OldTuple, keyOnly); err != nil {
 		return err
 	}
-	e.footer(b)
+	e.footer(b, rel, m.OldTuple)
 	return nil
 }
 
@@ -123,7 +131,7 @@ func (e *Encoder) Truncate(b *Batch, lsn pglogrepl.LSN, m *pglogrepl.TruncateMes
 			return err
 		}
 		e.header(b, rel, opTruncate, lsn)
-		e.footer(b)
+		e.footer(b, rel, nil)
 	}
 	return nil
 }
@@ -137,6 +145,7 @@ func (e *Encoder) relation(id uint32) (*relation, error) {
 }
 
 func (e *Encoder) header(b *Batch, rel *relation, op string, lsn pglogrepl.LSN) {
+	e.recStart = len(b.Buf)
 	buf := b.Buf
 	buf = append(buf, "{\"table\":"...)
 	buf = append(buf, rel.table...)
@@ -157,7 +166,7 @@ func (e *Encoder) header(b *Batch, rel *relation, op string, lsn pglogrepl.LSN) 
 	e.unchanged = e.unchanged[:0]
 }
 
-func (e *Encoder) footer(b *Batch) {
+func (e *Encoder) footer(b *Batch, rel *relation, identity *pglogrepl.TupleData) {
 	buf := b.Buf
 	if len(e.unchanged) > 0 {
 		buf = append(buf, ",\"unchanged\":["...)
@@ -169,10 +178,45 @@ func (e *Encoder) footer(b *Batch) {
 		}
 		buf = append(buf, ']')
 	}
-	buf = append(buf, '}', '\n')
+	buf = append(buf, '}')
+	keyStart := len(b.Keys)
+	b.Keys = appendKey(b.Keys, rel, identity)
+	b.Records = append(b.Records, Record{
+		Table:      rel.name,
+		valueStart: e.recStart, valueEnd: len(buf),
+		keyStart: keyStart, keyEnd: len(b.Keys),
+	})
+	buf = append(buf, '\n')
 	b.Buf = buf
 	b.Events++
 	e.seq++
+}
+
+// appendKey falls back to the table name when a row has no stable identity (no key columns,
+// REPLICA IDENTITY FULL, truncate), which keeps all such events of a table in one partition.
+func appendKey(dst []byte, rel *relation, identity *pglogrepl.TupleData) []byte {
+	if !rel.keyed || identity == nil {
+		return append(dst, rel.table...)
+	}
+	dst = append(dst, '{')
+	first := true
+	for i, c := range identity.Columns {
+		col := &rel.cols[i]
+		if !col.isKey {
+			continue
+		}
+		if !first {
+			dst = append(dst, ',')
+		}
+		first = false
+		dst = append(dst, col.key...)
+		if c.DataType == pglogrepl.TupleDataTypeText {
+			dst = appendValue(dst, col.oid, c.Data)
+		} else {
+			dst = append(dst, "null"...)
+		}
+	}
+	return append(dst, '}')
 }
 
 func (e *Encoder) tuple(b *Batch, rel *relation, field string, t *pglogrepl.TupleData, keyOnly bool) error {
