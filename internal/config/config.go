@@ -24,6 +24,8 @@ const (
 	saslScramSHA512 = "scram-sha-512"
 	maxTopicLen     = 249
 
+	maxKafkaMessageBytes = 100 << 20
+
 	minWebhookSecretLen = 16
 )
 
@@ -59,13 +61,14 @@ type Config struct {
 	WebhookRetryMin time.Duration `env:"WEBHOOK_RETRY_MIN" envDefault:"500ms"`
 	WebhookRetryMax time.Duration `env:"WEBHOOK_RETRY_MAX" envDefault:"30s"`
 
-	KafkaBrokers       []string `env:"KAFKA_BROKERS"`
-	KafkaTopicPrefix   string   `env:"KAFKA_TOPIC_PREFIX" envDefault:"walcast."`
-	KafkaClientID      string   `env:"KAFKA_CLIENT_ID" envDefault:"walcast"`
-	KafkaTLS           bool     `env:"KAFKA_TLS"`
-	KafkaSASLMechanism string   `env:"KAFKA_SASL_MECHANISM"`
-	KafkaSASLUsername  string   `env:"KAFKA_SASL_USERNAME"`
-	KafkaSASLPassword  string   `env:"KAFKA_SASL_PASSWORD"`
+	KafkaBrokers         []string `env:"KAFKA_BROKERS"`
+	KafkaTopicPrefix     string   `env:"KAFKA_TOPIC_PREFIX" envDefault:"walcast."`
+	KafkaClientID        string   `env:"KAFKA_CLIENT_ID" envDefault:"walcast"`
+	KafkaTLS             bool     `env:"KAFKA_TLS"`
+	KafkaSASLMechanism   string   `env:"KAFKA_SASL_MECHANISM"`
+	KafkaSASLUsername    string   `env:"KAFKA_SASL_USERNAME"`
+	KafkaSASLPassword    string   `env:"KAFKA_SASL_PASSWORD"`
+	KafkaMaxMessageBytes int32    `env:"KAFKA_MAX_MESSAGE_BYTES" envDefault:"1000012"`
 }
 
 func Load() (Config, error) {
@@ -177,6 +180,9 @@ func (c Config) validateKafka() error {
 		return fmt.Errorf("invalid KAFKA_SASL_MECHANISM %q (want %s, %s or %s)", c.KafkaSASLMechanism, saslPlain, saslScramSHA256, saslScramSHA512)
 	}
 
+	if c.KafkaMaxMessageBytes <= 0 || c.KafkaMaxMessageBytes > maxKafkaMessageBytes {
+		return fmt.Errorf("KAFKA_MAX_MESSAGE_BYTES must be between 1 and %d", maxKafkaMessageBytes)
+	}
 	if !topicPrefixRE.MatchString(c.KafkaTopicPrefix) || len(c.KafkaTopicPrefix) > maxTopicLen/2 {
 		return fmt.Errorf("invalid KAFKA_TOPIC_PREFIX %q", c.KafkaTopicPrefix)
 	}
