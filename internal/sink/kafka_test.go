@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -201,4 +202,101 @@ func TestNewKafka_rejectsUnknownSASLMechanism(t *testing.T) {
 	if _, err := NewKafka(KafkaConfig{Brokers: []string{"127.0.0.1:1"}, SASLMechanism: "gssapi"}, zerolog.Nop()); err == nil {
 		t.Fatal("expected an error")
 	}
+}
+
+func TestTopicName(t *testing.T) {
+	long := strings.Repeat("a", 63) + "." + strings.Repeat("b", 63)
+	tests := []struct {
+		name, prefix, table string
+		check               func(t *testing.T, topic string)
+	}{
+		{"legal name is untouched", "walcast.", "public.users", func(t *testing.T, topic string) {
+			if topic != "walcast.public.users" {
+				t.Fatalf("topic = %q", topic)
+			}
+		}},
+		{"quoted identifier is sanitised and hashed", "walcast.", "public.my table", func(t *testing.T, topic string) {
+			if !strings.HasPrefix(topic, "walcast.public.my_table-") || len(topic) != len("walcast.public.my_table-")+8 {
+				t.Fatalf("topic = %q", topic)
+			}
+		}},
+		{"overlong name is cut to the limit", strings.Repeat("p", 124), long, func(t *testing.T, topic string) {
+			if len(topic) != maxTopicLen {
+				t.Fatalf("len = %d, want %d", len(topic), maxTopicLen)
+			}
+		}},
+		{"non ascii bytes become underscores", "", "public.café", func(t *testing.T, topic string) {
+			for i := range len(topic) {
+				if !legalTopicByte(topic[i]) {
+					t.Fatalf("illegal byte in %q", topic)
+				}
+			}
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) { tt.check(t, topicName(tt.prefix, tt.table)) })
+	}
+
+	if a, b := topicName("", "public.my table"), topicName("", "public.my_table"); a == b {
+		t.Fatalf("different tables collide on %q", a)
+	}
+	if a, b := topicName("", "public.my table"), topicName("", "public.my table"); a != b {
+		t.Fatalf("topic name is not stable: %q vs %q", a, b)
+	}
+}
+
+func TestProduceGroup_firstErrorNamesTheRecord(t *testing.T) {
+	var got error
+	g := &produceGroup{remaining: 2, done: func(err error) { got = err }}
+	g.settle(&kgo.Record{Topic: "walcast.public.docs", Key: []byte(`{"id":7}`), Value: make([]byte, 2<<20)}, kerr.MessageTooLarge)
+	g.settle(&kgo.Record{Topic: "walcast.public.docs"}, nil)
+
+	if !errors.Is(got, ErrRejected) || !errors.Is(got, kerr.MessageTooLarge) {
+		t.Fatalf("err = %v, want a rejection wrapping MESSAGE_TOO_LARGE", got)
+	}
+	for _, want := range []string{"walcast.public.docs", `{"id":7}`, "2097152 byte"} {
+		if !strings.Contains(got.Error(), want) {
+			t.Fatalf("error %q does not mention %q", got, want)
+		}
+	}
+}
+
+func BenchmarkKafka_Send(b *testing.B) {
+	b.Run("no linger", func(b *testing.B) { benchmarkKafkaSend(b) })
+	b.Run("client default 10ms linger", func(b *testing.B) { benchmarkKafkaSend(b, kgo.ProducerLinger(10*time.Millisecond)) })
+}
+
+func benchmarkKafkaSend(b *testing.B, opts ...kgo.Opt) {
+	cluster, err := kfake.NewCluster(kfake.SeedTopics(4, "walcast.public.users"))
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer cluster.Close()
+	snk, err := NewKafka(KafkaConfig{Brokers: cluster.ListenAddrs(), TopicPrefix: "walcast.", ClientID: "bench", ClientOptions: opts}, zerolog.Nop())
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = snk.Close() }()
+
+	const events = 256
+	enc, batch := newEncoder(), &event.Batch{}
+	for i := range events {
+		col := func(v string) *pglogrepl.TupleDataColumn {
+			return &pglogrepl.TupleDataColumn{DataType: pglogrepl.TupleDataTypeText, Data: []byte(v)}
+		}
+		msg := &pglogrepl.InsertMessage{RelationID: usersRel, Tuple: &pglogrepl.TupleData{Columns: []*pglogrepl.TupleDataColumn{col(fmt.Sprint(i)), col("note")}}}
+		if err := enc.Insert(batch, 1, msg); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		settled := make(chan error, 1)
+		snk.Send(context.Background(), batch, func(err error) { settled <- err })
+		if err := <-settled; err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/events, "ns/event")
 }
