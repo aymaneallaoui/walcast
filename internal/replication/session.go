@@ -177,6 +177,9 @@ type chunkReads struct {
 	emitted int
 	retry   [][]string
 	key     []byte
+	// id names the chunk by its marker's LSN, which no other delivery shares. Counters would not
+	// do: they restart with every worker, and a resumed scan would reuse the first chunk's ids.
+	id string
 }
 
 // keyMove is the insert half of a key-changing update that left out an unchanged TOAST column. The
@@ -476,7 +479,7 @@ func (s *session) handleMarker(m *pglogrepl.LogicalDecodingMessage) {
 			s.awaited = &awaitedChunk{result: chunkResult{generation: mk.Generation, number: mk.Chunk, invalid: true}}
 			return
 		}
-		s.reads = &chunkReads{chunk: c, lsn: m.LSN}
+		s.reads = &chunkReads{chunk: c, lsn: m.LSN, id: fmt.Sprintf("%d.%s", c.tableOID, m.LSN)}
 	}
 }
 
@@ -495,7 +498,7 @@ func (s *session) emitReads() error {
 		case rowRetry:
 			r.retry = append(r.retry, r.chunk.keys[r.next])
 		case rowEmit:
-			if err := s.enc.Read(s.cur, r.lsn, r.chunk.table, row, r.chunk.backfillID, uint64(r.next), r.chunk.ts); err != nil {
+			if err := s.enc.Read(s.cur, r.lsn, r.chunk.table, row, r.id, uint64(r.next), r.chunk.ts); err != nil {
 				return fmt.Errorf("encode backfill row: %w", err)
 			}
 			r.emitted++
@@ -516,7 +519,7 @@ func (s *session) emitReads() error {
 	s.tracker.prune(r.chunk.xmin)
 	s.awaited = &awaitedChunk{lsn: r.lsn, result: chunkResult{
 		generation: r.chunk.generation, number: r.chunk.number, emitted: r.emitted, retry: r.retry,
-		orphans: s.takeKeyMoves(r.chunk.tableName),
+		moves: s.takeKeyMoves(),
 	}}
 	s.reads = nil
 	return nil
@@ -541,7 +544,7 @@ func (s *session) reportChunk() {
 	case s.link.results <- a.result:
 		s.awaited = nil
 		// A chunk that came back clean, with no key move seen since, leaves nothing to replay for.
-		if !a.result.invalid && len(a.result.retry) == 0 && len(a.result.orphans) == 0 && len(s.keyMoves) == 0 {
+		if !a.result.invalid && len(a.result.retry) == 0 && len(a.result.moves) == 0 && len(s.keyMoves) == 0 {
 			s.ledger.Release()
 		}
 	default:
@@ -561,17 +564,12 @@ func (s *session) observe(records []event.Record) {
 	}
 }
 
-// takeKeyMoves hands over the moves of the table being backfilled and forgets the rest: a table
-// that is done has its baselines, and one that has not started will meet the row in its scan.
-func (s *session) takeKeyMoves(table string) [][]byte {
-	var keys [][]byte
-	for _, move := range s.keyMoves {
-		if move.table == table {
-			keys = append(keys, move.key)
-		}
-	}
+// takeKeyMoves hands every move to the worker, which knows what each table needs: read the row
+// again now, park the key for a table waiting its turn, or drop it for one that is done.
+func (s *session) takeKeyMoves() []keyMove {
+	moves := s.keyMoves
 	s.keyMoves = nil
-	return keys
+	return moves
 }
 
 func (s *session) sealable() bool {

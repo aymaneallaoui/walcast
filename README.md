@@ -37,6 +37,7 @@ CREATE TABLE walcast_state.backfills (
     status          text NOT NULL,
     upper_key       text,
     last_key        text,
+    pending_keys    text,
     rows_emitted    bigint NOT NULL DEFAULT 0,
     started_at      timestamptz NOT NULL DEFAULT now(),
     finished_at     timestamptz
@@ -56,7 +57,7 @@ One JSON object per line:
 - `op` is `insert`, `update`, `delete`, `truncate`, or `read` for a row copied by a backfill.
 - An update that changes the row's replica identity (its primary key) is emitted as a `delete` of the old key followed by an `insert` of the new one, both carrying `"origin":"update"`. Every key's history then stays self-consistent for consumers partitioned by key.
 - `commit_lsn` + `seq` identify an event; use them to deduplicate.
-- A `read` event carries the whole row in `new` and is an upsert. It has `backfill` + `seq` instead of `commit_lsn` and `txid`: a chunk is positioned at a marker in the WAL, and a marker's LSN can equal the `commit_lsn` of the next transaction, so the two must not share an id space. A repeated `read` is harmless to apply again.
+- A `read` event carries the whole row in `new` and is an upsert. It has `backfill` + `seq` instead of `commit_lsn` and `txid`; `backfill` is the table's OID and the chunk's marker LSN, so it is unique per delivered chunk, also across restarts: a chunk is positioned at a marker in the WAL, and a marker's LSN can equal the `commit_lsn` of the next transaction, so the two must not share an id space. A repeated `read` is harmless to apply again.
 - The `insert` half of a key change can list `unchanged` columns. Take them from the row the preceding `delete` removed. During a backfill walcast sends such a row again as a `read`, so a consumer that started empty still gets every column.
 - `old` holds the replica identity columns only, or the full row with `REPLICA IDENTITY FULL`.
 - `unchanged` lists TOASTed columns Postgres did not resend. They are absent from `new`, not null.
@@ -65,7 +66,7 @@ One JSON object per line:
 
 ## Backfill
 
-`BACKFILL_TABLES` copies the rows that existed before streaming started, as `read` events, while the stream keeps running. It is off by default, and each table is copied once; progress lives in `STATE_SCHEMA.backfills`, so a restart continues where it stopped and a crash repeats at most one chunk.
+`BACKFILL_TABLES` copies the rows that existed before streaming started, as `read` events, while the stream keeps running. Tables are copied one at a time, and walcast's own state tables are never copied, not even with `all`. It is off by default, and each table is copied once; progress lives in `STATE_SCHEMA.backfills`, so a restart continues where it stopped and a crash repeats at most one chunk.
 
 Rows are read in primary-key chunks under a `REPEATABLE READ` snapshot. After each chunk walcast writes a marker into the WAL with `pg_logical_emit_message` and merges the chunk into the stream where that marker is decoded. A chunk row is dropped when the stream already delivered a newer complete image of the same key, and read again when the stream only delivered a patch that lacks an unchanged TOAST column. "Newer" is decided by transaction id, not by position: on Postgres a change can be decoded before any query can see it (a writer waiting for a synchronous standby is the long version of that window), so every change by a transaction at or above the chunk snapshot's `xmin` counts as newer. A consumer that applies events in order ends up with exactly the table.
 
@@ -76,7 +77,7 @@ A table is refused, with an error that says why, unless all of this holds:
 - row-level security does not hide rows from the walcast role
 - the source is a writable primary running Postgres 14 or newer
 
-The role needs `SELECT` on backfilled tables. A write transaction that was already open when the session started delays the first chunk until it ends, and walcast logs that it is waiting. While a key-changing update on a backfilled table is waiting for its row to be read again, the confirmed LSN stays before that transaction, so a crash replays it instead of forgetting it. Delete a table's row from `STATE_SCHEMA.backfills` to copy it again; accepting a slot gap with `SLOT_RECREATE_GENERATION` does that for every configured table, which is also how the gap gets repaired. With the Kafka sink and `KAFKA_EMIT_TRUNCATE` off, a `TRUNCATE` during or after a backfill is not visible to consumers.
+The role needs `SELECT` on backfilled tables. A write transaction that was already open when the session started delays the first chunk until it ends, and walcast logs that it is waiting. While a key-changing update on a backfilled table is waiting for its row to be read again, the confirmed LSN stays before that transaction, so a crash replays it instead of forgetting it. A key change on a table that is waiting for its turn is saved on that table's progress row and read first when its turn comes, so the confirmed LSN is not held back for the length of another table's copy. Delete a table's row from `STATE_SCHEMA.backfills` to copy it again; accepting a slot gap with `SLOT_RECREATE_GENERATION` does that for every configured table, which is also how the gap gets repaired. With the Kafka sink and `KAFKA_EMIT_TRUNCATE` off, a `TRUNCATE` during or after a backfill is not visible to consumers.
 
 ## Sinks
 

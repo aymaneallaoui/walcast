@@ -114,10 +114,11 @@ func stateError(action string, err error) error {
 }
 
 type backfillProgress struct {
-	status string
-	upper  []string
-	last   []string
-	rows   int64
+	status  string
+	upper   []string
+	last    []string
+	pending [][]string
+	rows    int64
 }
 
 // ensureBackfillTable follows ensureStateTable: no DDL once the table exists, so it can be
@@ -137,6 +138,7 @@ func ensureBackfillTable(ctx context.Context, conn *pgconn.PgConn, schema string
 	status          text NOT NULL,
 	upper_key       text,
 	last_key        text,
+	pending_keys    text,
 	rows_emitted    bigint NOT NULL DEFAULT 0,
 	started_at      timestamptz NOT NULL DEFAULT now(),
 	finished_at     timestamptz
@@ -155,7 +157,7 @@ func loadBackfill(ctx context.Context, conn *pgconn.PgConn, schema string, table
 INSERT INTO %[1]s.%[2]s AS b (table_name, table_oid, slot_generation, status) VALUES ($1, $2::oid, $3::int, $4)
 ON CONFLICT (table_name) DO UPDATE
 SET table_oid = EXCLUDED.table_oid, slot_generation = EXCLUDED.slot_generation, status = EXCLUDED.status,
-    upper_key = NULL, last_key = NULL, rows_emitted = 0, started_at = now(), finished_at = NULL
+    upper_key = NULL, last_key = NULL, pending_keys = NULL, rows_emitted = 0, started_at = now(), finished_at = NULL
 WHERE b.table_oid <> EXCLUDED.table_oid OR b.slot_generation <> EXCLUDED.slot_generation`, schema, progressTable),
 		name, oid, generation, backfillRunning)
 	if err != nil {
@@ -163,7 +165,7 @@ WHERE b.table_oid <> EXCLUDED.table_oid OR b.slot_generation <> EXCLUDED.slot_ge
 	}
 
 	rows, err := queryParams(ctx, conn, fmt.Sprintf(
-		"SELECT status, upper_key, last_key, rows_emitted::text FROM %s.%s WHERE table_name = $1", schema, progressTable), name)
+		"SELECT status, upper_key, last_key, rows_emitted::text, pending_keys FROM %s.%s WHERE table_name = $1", schema, progressTable), name)
 	if err != nil {
 		return backfillProgress{}, stateError("read backfill progress", err)
 	}
@@ -180,7 +182,36 @@ WHERE b.table_oid <> EXCLUDED.table_oid OR b.slot_generation <> EXCLUDED.slot_ge
 	if progress.rows, err = strconv.ParseInt(string(rows[0][3]), 10, 64); err != nil {
 		return backfillProgress{}, fmt.Errorf("read backfill progress: rows: %w", err)
 	}
+	if rows[0][4] != nil {
+		if err := json.Unmarshal(rows[0][4], &progress.pending); err != nil {
+			return backfillProgress{}, fmt.Errorf("read backfill progress: pending keys: %w", err)
+		}
+	}
 	return progress, nil
+}
+
+// parkPendingKey appends to the row of a table that is still being copied; with no such row the
+// statement changes nothing, which is what a table that has not started needs.
+func parkPendingKey(ctx context.Context, conn *pgconn.PgConn, schema, table string, key []string) error {
+	encoded, err := json.Marshal([][]string{key})
+	if err != nil {
+		return fmt.Errorf("encode pending key: %w", err)
+	}
+	_, err = queryParams(ctx, conn, fmt.Sprintf(
+		"UPDATE %s.%s SET pending_keys = (COALESCE(pending_keys, '[]')::jsonb || $2::jsonb)::text WHERE table_name = $1 AND status <> $3",
+		schema, progressTable), table, string(encoded), backfillDone)
+	if err != nil {
+		return stateError("park key move", err)
+	}
+	return nil
+}
+
+func clearPendingKeys(ctx context.Context, conn *pgconn.PgConn, schema string, table backfillTable) error {
+	_, err := queryParams(ctx, conn, fmt.Sprintf("UPDATE %s.%s SET pending_keys = NULL WHERE table_name = $1", schema, progressTable), table.qualified())
+	if err != nil {
+		return stateError("clear pending keys", err)
+	}
+	return nil
 }
 
 func saveBackfillUpper(ctx context.Context, conn *pgconn.PgConn, schema string, table backfillTable, upper []string) error {

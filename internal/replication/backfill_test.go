@@ -43,9 +43,9 @@ func markerMsg(t *testing.T, lsn pglogrepl.LSN, m marker) []byte {
 
 func usersChunk(generation, number, xmin uint64, ids ...string) *chunk {
 	c := &chunk{
-		generation: generation, number: number, xmin: xmin, backfillID: "16384.1.1", ts: []byte("2026-09-20T12:00:00Z"),
-		tableName: "public.users",
-		table:     event.NewTable("public", "users", []event.Column{{Name: "id", OID: 20, Key: true}, {Name: "name", OID: 25}}),
+		generation: generation, number: number, xmin: xmin, ts: []byte("2026-09-20T12:00:00Z"),
+		tableName: "public.users", tableOID: 16384,
+		table: event.NewTable("public", "users", []event.Column{{Name: "id", OID: 20, Key: true}, {Name: "name", OID: 25}}),
 	}
 	for _, id := range ids {
 		c.rows = append(c.rows, [][]byte{[]byte(id), []byte("from the chunk")})
@@ -97,8 +97,8 @@ func TestSession_mergesChunkAtItsMarker(t *testing.T) {
 		t.Fatalf("awaited = %+v, want 2 emitted and key 2 to be read again", a)
 	}
 	value := string(s.cur.Value(reads[0]))
-	if strings.Contains(value, "commit_lsn") || !strings.Contains(value, `"backfill":"16384.1.1"`) {
-		t.Fatalf("read event must carry a backfill id and no commit_lsn: %s", value)
+	if strings.Contains(value, "commit_lsn") || !strings.Contains(value, `"backfill":"16384.0/1F4"`) {
+		t.Fatalf("read event must be named after its table and marker LSN, and carry no commit_lsn: %s", value)
 	}
 }
 
@@ -164,7 +164,7 @@ func TestSession_chunkSpansBatchesAndOnlyTheLastIsAcked(t *testing.T) {
 }
 
 func TestKeyValues(t *testing.T) {
-	table := backfillTable{schema: "public", name: "orders", keyColumns: []string{"region", "id", "live"}}
+	keyColumns := []string{"region", "id", "live"}
 	tests := []struct {
 		name    string
 		encoded string
@@ -181,7 +181,7 @@ func TestKeyValues(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := keyValues(table, []byte(tt.encoded))
+			got, err := keyValues(keyColumns, "public.orders", []byte(tt.encoded))
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
 			}
@@ -228,8 +228,8 @@ func TestSession_keyMoveHoldsTheAckUntilItsRowIsReadAgain(t *testing.T) {
 	if err := s.emitReads(); err != nil {
 		t.Fatal(err)
 	}
-	if a := s.awaited; a == nil || len(a.result.orphans) != 1 || string(a.result.orphans[0]) != `{"id":9}` {
-		t.Fatalf("awaited = %+v, want the moved key handed to the worker", a)
+	if a := s.awaited; a == nil || len(a.result.moves) != 1 || string(a.result.moves[0].key) != `{"id":9}` || a.result.moves[0].table != "public.users" {
+		t.Fatalf("awaited = %+v, want the moved key handed to the worker with its table", a)
 	}
 	s.reportChunk()
 	if got := s.ledger.Flushed(); got != 300 {
@@ -263,5 +263,50 @@ func TestSession_stopMarkerReleasesTheHold(t *testing.T) {
 	s.ledger.Done(s.ledger.Add(2000, 1))
 	if got := s.ledger.Flushed(); got != 2000 {
 		t.Fatalf("reported = %s, a key move after the backfill must not hold acks", got)
+	}
+}
+
+// A resumed scan starts its counters again, so only the marker's LSN keeps two chunks apart.
+func TestSession_readIDsDifferBetweenChunksWithTheSameCounters(t *testing.T) {
+	s := backfillSession(t)
+	s.feed(t, markerMsg(t, 100, marker{Session: s.link.session, Kind: markerTrack, Generation: 1, Table: "public.users", Ref: 744}))
+	ids := map[string]bool{}
+	for _, lsn := range []pglogrepl.LSN{500, 900} {
+		s.link.register(usersChunk(1, 1, 744, "1"))
+		s.feed(t, markerMsg(t, lsn, marker{Session: s.link.session, Kind: markerChunk, Generation: 1, Chunk: 1}))
+		if err := s.emitReads(); err != nil {
+			t.Fatal(err)
+		}
+		ids[s.reads0ID(t)] = true
+		s.awaited = nil
+	}
+	if len(ids) != 2 {
+		t.Fatalf("two chunks with the same generation and number share a backfill id: %v", ids)
+	}
+}
+
+func (s *session) reads0ID(t *testing.T) string {
+	t.Helper()
+	var ev struct {
+		Backfill string `json:"backfill"`
+	}
+	last := s.cur.Records[len(s.cur.Records)-1]
+	if err := json.Unmarshal(s.cur.Value(last), &ev); err != nil {
+		t.Fatal(err)
+	}
+	return ev.Backfill
+}
+
+func TestSession_keyMovesOfOtherTablesReachTheWorker(t *testing.T) {
+	s := backfillSession(t)
+	s.keyMoves = []keyMove{{table: "public.orders", key: []byte(`{"id":7}`)}}
+	s.feed(t, markerMsg(t, 100, marker{Session: s.link.session, Kind: markerTrack, Generation: 1, Table: "public.users", Ref: 744}))
+	s.link.register(usersChunk(1, 1, 744))
+	s.feed(t, markerMsg(t, 500, marker{Session: s.link.session, Kind: markerChunk, Generation: 1, Chunk: 1}))
+	if err := s.emitReads(); err != nil {
+		t.Fatal(err)
+	}
+	if moves := s.awaited.result.moves; len(moves) != 1 || moves[0].table != "public.orders" {
+		t.Fatalf("moves = %+v, want the other table's key move kept for the worker to park", moves)
 	}
 }

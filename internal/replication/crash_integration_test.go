@@ -271,19 +271,20 @@ func (l *eventLog) count(match func(map[string]any) bool) int {
 	return n
 }
 
-// dedupe drops replayed stream events the way the README tells consumers to, on commit_lsn and
-// seq. Reads have no commit_lsn and are upserts, so a repeated chunk is applied again harmlessly.
+// dedupe drops repeated events the way the README tells consumers to: stream events on commit_lsn
+// and seq, reads on backfill and seq. Ids that repeated across different rows would lose data here.
 func dedupe(events []map[string]any) []map[string]any {
 	seen := make(map[string]struct{})
 	out := events[:0:0]
 	for _, ev := range events {
-		if lsn, ok := ev["commit_lsn"].(string); ok {
-			id := fmt.Sprintf("%s/%v", lsn, ev["seq"])
-			if _, dup := seen[id]; dup {
-				continue
-			}
-			seen[id] = struct{}{}
+		id := fmt.Sprintf("c/%v/%v", ev["commit_lsn"], ev["seq"])
+		if ev["op"] == "read" {
+			id = fmt.Sprintf("b/%v/%v", ev["backfill"], ev["seq"])
 		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
 		out = append(out, ev)
 	}
 	return out

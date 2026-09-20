@@ -350,3 +350,65 @@ func TestBackfillWaitsForAWriterItCannotSee(t *testing.T) {
 		t.Fatalf("consumer ends with name %q, want the committed value: %v", got, events)
 	}
 }
+
+func TestBackfillAllNeverCopiesWalcastsOwnTables(t *testing.T) {
+	h := newHarness(t, func(c *config.Config) {
+		c.PublicationTables = nil
+		c.BackfillTables, c.BackfillChunkRows, c.BackfillChunkBytes = []string{config.BackfillAll}, 100, 1<<20
+	})
+	h.exec(fmt.Sprintf("INSERT INTO %s VALUES (1, 'row', true)", h.table))
+
+	stop := h.startSession()
+	h.waitFor("the user table to be copied", func() bool { status, _ := h.backfillStatus(); return status == "done" })
+	stop()
+
+	events, _ := h.sink.snapshot()
+	for _, ev := range events {
+		if table, _ := ev["table"].(string); strings.HasPrefix(table, h.cfg.StateSchema+".") {
+			t.Fatalf("walcast's own state was emitted: %v", ev)
+		}
+	}
+	t.Cleanup(func() {
+		h.exec(fmt.Sprintf("DELETE FROM %s.backfills WHERE table_name NOT IN (SELECT schemaname || '.' || tablename FROM pg_tables)", h.cfg.StateSchema))
+	})
+}
+
+func TestBackfillRefusesItsOwnStateTables(t *testing.T) {
+	h := newHarness(t, func(c *config.Config) {
+		c.PublicationTables = nil
+		c.BackfillTables, c.BackfillChunkRows, c.BackfillChunkBytes = []string{c.StateSchema + ".slots"}, 100, 1<<20
+	})
+	if err := h.runFresh(); !errors.Is(err, replication.ErrBackfillRefused) {
+		t.Fatalf("err = %v, want ErrBackfillRefused", err)
+	}
+}
+
+// A key move that arrived while another table was being copied is parked on this table's progress
+// row. Row 5 is behind the saved cursor, so only the parked key can make walcast read it.
+func TestBackfillReadsParkedKeysBeforeResumingTheScan(t *testing.T) {
+	h := newHarness(t, nil)
+	h.exec(fmt.Sprintf("INSERT INTO %s SELECT g, 'seed ' || g, true FROM generate_series(1, 20) g", h.table))
+	h.startSession()()
+	backfillOf(100, 1<<20)(&h.cfg)
+
+	h.exec(fmt.Sprintf(`INSERT INTO %s.backfills (table_name, table_oid, slot_generation, status, upper_key, last_key, pending_keys)
+VALUES ('public.%s', 'public.%s'::regclass::oid, 0, 'running', '["20"]', '["10"]', '[["5"]]')`, h.cfg.StateSchema, h.table, h.table))
+
+	stop := h.startSession()
+	h.waitFor("backfill to be marked done", func() bool { status, _ := h.backfillStatus(); return status == "done" })
+	stop()
+
+	var ids []float64
+	events, _ := h.sink.snapshot()
+	for _, ev := range events {
+		if ev["op"] == "read" {
+			ids = append(ids, ev["new"].(map[string]any)["id"].(float64))
+		}
+	}
+	if len(ids) != 11 || ids[0] != 5 || ids[1] != 11 || ids[10] != 20 {
+		t.Fatalf("read ids = %v, want the parked row 5 first and then the scan from 11 to 20", ids)
+	}
+	if got := h.exec(fmt.Sprintf("SELECT pending_keys IS NULL FROM %s.backfills WHERE table_name = 'public.%s'", h.cfg.StateSchema, h.table)); string(got[0][0]) != "t" {
+		t.Fatal("parked keys were not cleared after they were read")
+	}
+}
