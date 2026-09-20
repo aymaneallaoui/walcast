@@ -49,6 +49,10 @@ type Config struct {
 	StateSchema            string `env:"STATE_SCHEMA" envDefault:"walcast_state"`
 	SlotRecreateGeneration int    `env:"SLOT_RECREATE_GENERATION" envDefault:"0"`
 
+	BackfillTables     []string `env:"BACKFILL_TABLES"`
+	BackfillChunkRows  int      `env:"BACKFILL_CHUNK_ROWS" envDefault:"2000"`
+	BackfillChunkBytes int      `env:"BACKFILL_CHUNK_BYTES" envDefault:"4194304"`
+
 	FeedbackInterval time.Duration `env:"FEEDBACK_INTERVAL" envDefault:"5s"`
 	ServerTimeout    time.Duration `env:"SERVER_TIMEOUT" envDefault:"60s"`
 	BatchMaxBytes    int           `env:"BATCH_MAX_BYTES" envDefault:"65536"`
@@ -88,6 +92,9 @@ func Load() (Config, error) {
 	for i, t := range cfg.PublicationTables {
 		cfg.PublicationTables[i] = strings.TrimSpace(t)
 	}
+	for i, t := range cfg.BackfillTables {
+		cfg.BackfillTables[i] = strings.TrimSpace(t)
+	}
 	for i, b := range cfg.KafkaBrokers {
 		cfg.KafkaBrokers[i] = strings.TrimSpace(b)
 	}
@@ -95,6 +102,28 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+// BackfillAll is the BACKFILL_TABLES value that selects every table of the publication.
+const BackfillAll = "all"
+
+func (c Config) validateBackfill() error {
+	if len(c.BackfillTables) == 0 {
+		return nil
+	}
+	if c.BackfillChunkRows <= 0 || c.BackfillChunkBytes <= 0 {
+		return errors.New("BACKFILL_CHUNK_ROWS and BACKFILL_CHUNK_BYTES must be positive")
+	}
+	if len(c.BackfillTables) == 1 && c.BackfillTables[0] == BackfillAll {
+		return nil
+	}
+	for _, t := range c.BackfillTables {
+		// A bare "all" inside a list is ambiguous; a table of that name is written public.all.
+		if t == BackfillAll || !tableRE.MatchString(t) {
+			return fmt.Errorf("invalid table %q in BACKFILL_TABLES: use schema.table names, or the single value %q", t, BackfillAll)
+		}
+	}
+	return nil
 }
 
 // reservedSchema keeps walcast's table out of schemas it does not own: Postgres reserves pg_, and
@@ -122,6 +151,9 @@ func (c Config) Validate() error {
 	}
 	if c.SlotRecreateGeneration < 0 {
 		return errors.New("SLOT_RECREATE_GENERATION must not be negative")
+	}
+	if err := c.validateBackfill(); err != nil {
+		return err
 	}
 	if c.ShutdownTimeout <= 0 || c.SettleTimeout <= 0 {
 		return errors.New("SHUTDOWN_TIMEOUT and SINK_SETTLE_TIMEOUT must be positive")
