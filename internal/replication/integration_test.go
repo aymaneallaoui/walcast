@@ -112,6 +112,7 @@ func newHarness(t *testing.T, tune func(*config.Config)) *harness {
 	h.cfg = config.Config{
 		DatabaseURL:       dbURL,
 		ShutdownTimeout:   5 * time.Second,
+		SettleTimeout:     time.Minute,
 		SlotName:          fmt.Sprintf("walcast_it_slot_%d", suffix),
 		PublicationName:   fmt.Sprintf("walcast_it_pub_%d", suffix),
 		PublicationTables: []string{"public." + h.table},
