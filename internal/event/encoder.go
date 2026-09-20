@@ -36,11 +36,13 @@ type relation struct {
 	name    string
 	table   []byte
 	keyed   bool
+	ignored bool
 	cols    []column
 }
 
 type Encoder struct {
 	rels      map[uint32]*relation
+	ignore    string
 	commitLSN pglogrepl.LSN
 	xid       uint32
 	seq       uint64
@@ -54,6 +56,12 @@ func NewEncoder() *Encoder {
 	return &Encoder{rels: make(map[uint32]*relation)}
 }
 
+// IgnoreSchema drops every change to tables in schema. walcast keeps its own state in the source
+// database, and an all-tables publication would otherwise stream those writes to consumers.
+func (e *Encoder) IgnoreSchema(schema string) {
+	e.ignore = schema
+}
+
 func (e *Encoder) Relation(m *pglogrepl.RelationMessage) {
 	name := m.Namespace + "." + m.RelationName
 	rel := &relation{
@@ -61,6 +69,7 @@ func (e *Encoder) Relation(m *pglogrepl.RelationMessage) {
 		relname: m.RelationName,
 		name:    name,
 		table:   appendString(nil, []byte(name)),
+		ignored: e.ignore != "" && m.Namespace == e.ignore,
 		cols:    make([]column, len(m.Columns)),
 	}
 	for i, c := range m.Columns {
@@ -86,7 +95,7 @@ func (e *Encoder) Begin(m *pglogrepl.BeginMessage) {
 
 func (e *Encoder) Insert(b *Batch, lsn pglogrepl.LSN, m *pglogrepl.InsertMessage) error {
 	rel, err := e.relation(m.RelationID)
-	if err != nil {
+	if err != nil || rel.ignored {
 		return err
 	}
 	e.header(b, rel, OpInsert, "", lsn)
@@ -98,7 +107,7 @@ func (e *Encoder) Insert(b *Batch, lsn pglogrepl.LSN, m *pglogrepl.InsertMessage
 
 func (e *Encoder) Update(b *Batch, lsn pglogrepl.LSN, m *pglogrepl.UpdateMessage) error {
 	rel, err := e.relation(m.RelationID)
-	if err != nil {
+	if err != nil || rel.ignored {
 		return err
 	}
 	if rel.keyed && m.OldTupleType == pglogrepl.UpdateMessageTupleTypeKey && keyChanged(rel, m.OldTuple, m.NewTuple) {
@@ -150,7 +159,7 @@ func keyChanged(rel *relation, old, updated *pglogrepl.TupleData) bool {
 
 func (e *Encoder) Delete(b *Batch, lsn pglogrepl.LSN, m *pglogrepl.DeleteMessage) error {
 	rel, err := e.relation(m.RelationID)
-	if err != nil {
+	if err != nil || rel.ignored {
 		return err
 	}
 	e.header(b, rel, OpDelete, "", lsn)
@@ -166,6 +175,9 @@ func (e *Encoder) Truncate(b *Batch, lsn pglogrepl.LSN, m *pglogrepl.TruncateMes
 		rel, err := e.relation(id)
 		if err != nil {
 			return err
+		}
+		if rel.ignored {
+			continue
 		}
 		e.header(b, rel, OpTruncate, "", lsn)
 		if err := e.footer(b, rel, nil, nil); err != nil {
