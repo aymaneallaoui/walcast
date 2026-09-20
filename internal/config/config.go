@@ -69,6 +69,7 @@ type Config struct {
 	KafkaSASLMechanism   string   `env:"KAFKA_SASL_MECHANISM"`
 	KafkaSASLUsername    string   `env:"KAFKA_SASL_USERNAME"`
 	KafkaSASLPassword    string   `env:"KAFKA_SASL_PASSWORD"`
+	KafkaEmitTruncate    bool     `env:"KAFKA_EMIT_TRUNCATE"`
 	KafkaMaxMessageBytes int32    `env:"KAFKA_MAX_MESSAGE_BYTES" envDefault:"1000012"`
 }
 

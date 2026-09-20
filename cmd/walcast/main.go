@@ -63,6 +63,7 @@ func newSink(cfg config.Config, log zerolog.Logger) (sink.Sink, error) {
 			SASLUsername:    cfg.KafkaSASLUsername,
 			SASLPassword:    cfg.KafkaSASLPassword,
 			MaxMessageBytes: cfg.KafkaMaxMessageBytes,
+			EmitTruncate:    cfg.KafkaEmitTruncate,
 		}, log)
 	default:
 		return sink.NewWriter(os.Stdout), nil
