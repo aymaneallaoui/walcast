@@ -18,7 +18,21 @@ Other targets: `make build`, `make test`, `make test-integration` (uses `DATABAS
 
 The publication and the replication slot are created on first start if missing. An existing publication is never altered; a mismatch with `PUBLICATION_TABLES` is logged. If the slot disappears or is invalidated while walcast runs, it exits instead of recreating it, because a fresh slot would silently skip every change made in between.
 
-walcast also remembers the slot in the source database, in `STATE_SCHEMA.slots`, so the same protection holds across restarts. When the table knows a slot that no longer exists (dropped by hand, lost in a failover or a restore), walcast refuses to start and prints the exact `SLOT_RECREATE_GENERATION` value that accepts the gap. That value works once: after the slot is recreated the stored generation moves on, so leaving the variable set cannot hide a second loss. A slot that already exists without a row is adopted. The role needs `CREATE` on the database for the first start and write access to the state schema afterwards. Changes to tables in the state schema are never emitted as events.
+walcast also remembers the slot in the source database, in `STATE_SCHEMA.slots`, so the same protection holds across restarts. When the table knows a slot that no longer exists (dropped by hand, lost in a failover or a restore), walcast refuses to start and prints the exact `SLOT_RECREATE_GENERATION` value that accepts the gap. A value authorises at most one start: it is used up when the slot is recreated, and also when it was set while the slot still existed, so a forgotten variable cannot let a later loss through. A slot that already exists without a row is adopted. Changes to that one table are never emitted as events; any other table in the same schema streams normally.
+
+On the first start the role needs `CREATE` on the database to make the schema and table. To run without it, create them ahead of time and grant the role `USAGE` on the schema and `SELECT, INSERT, UPDATE` on the table; walcast runs no DDL once the table exists:
+
+```sql
+CREATE SCHEMA walcast_state;
+CREATE TABLE walcast_state.slots (
+    slot_name    text PRIMARY KEY,
+    generation   integer NOT NULL DEFAULT 0,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    recreated_at timestamptz
+);
+```
+
+Anyone who can write to this table can switch the protection off, so grant it to the walcast role only.
 
 ## Events
 
@@ -79,8 +93,8 @@ Read from the environment. A `.env` file is loaded if present and never override
 | `SLOT_NAME` | `walcast_slot` | lowercase letters, digits, underscore |
 | `PUBLICATION_NAME` | `walcast_pub` | same charset |
 | `PUBLICATION_TABLES` | all tables | comma separated `schema.table`; all tables needs superuser |
-| `STATE_SCHEMA` | `walcast_state` | schema in the source database for walcast's own state; must differ from the database role, because `search_path` starts with `"$user"` and the role's unqualified tables would land in it |
-| `SLOT_RECREATE_GENERATION` | `0` | set to the value from the "slot is gone" error to recreate a lost slot once and accept the gap |
+| `STATE_SCHEMA` | `walcast_state` | schema in the source database for walcast's own state; not `public` or a system schema, and not the database role's name, because `search_path` starts with `"$user"` and the role's unqualified tables would land in it |
+| `SLOT_RECREATE_GENERATION` | `0` | set to the value from the "slot is gone" error to recreate a lost slot and accept the gap; each value works for one start only |
 | `LOG_LEVEL` | `info` | `trace`, `debug`, `info`, `warn`, `error` |
 | `LOG_FORMAT` | `json` | `json` or `console` |
 | `SHUTDOWN_TIMEOUT` | `10s` | drain deadline on SIGINT/SIGTERM |
