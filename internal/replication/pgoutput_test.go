@@ -80,3 +80,32 @@ func insertMsg(values ...string) []byte {
 	}
 	return buf
 }
+
+const unchangedToast = "\x00toast"
+
+// updateMsg builds an update without an old tuple; the unchangedToast value stands for a column
+// Postgres left out because it is TOASTed and did not change.
+func updateMsg(values ...string) []byte {
+	buf := []byte{'U'}
+	buf = binary.BigEndian.AppendUint32(buf, testRelID)
+	buf = append(buf, 'N')
+	buf = binary.BigEndian.AppendUint16(buf, uint16(len(values)))
+	for _, v := range values {
+		if v == unchangedToast {
+			buf = append(buf, 'u')
+			continue
+		}
+		buf = append(buf, 't')
+		buf = binary.BigEndian.AppendUint32(buf, uint32(len(v)))
+		buf = append(buf, v...)
+	}
+	return buf
+}
+
+func logicalMsg(lsn pglogrepl.LSN, prefix string, content []byte) []byte {
+	buf := []byte{'M', 0}
+	buf = binary.BigEndian.AppendUint64(buf, uint64(lsn))
+	buf = cstring(buf, prefix)
+	buf = binary.BigEndian.AppendUint32(buf, uint32(len(content)))
+	return append(buf, content...)
+}

@@ -24,13 +24,35 @@ const (
 var ErrSlotUnusable = errors.New("replication: slot is unusable")
 
 func connect(ctx context.Context, databaseURL string) (*pgconn.PgConn, error) {
+	return connectWith(ctx, databaseURL, map[string]string{"replication": "database"})
+}
+
+// connectSQL opens the ordinary connection a backfill reads chunks and writes progress on.
+func connectSQL(ctx context.Context, databaseURL string) (*pgconn.PgConn, error) {
+	return connectWith(ctx, databaseURL, nil)
+}
+
+// connectWith pins every setting a type's text output depends on. A backfilled row is rendered by
+// a different session than the stream, and the two must agree byte for byte or keys stop matching.
+func connectWith(ctx context.Context, databaseURL string, extra map[string]string) (*pgconn.PgConn, error) {
 	cfg, err := pgconn.ParseConfig(databaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse database url: %w", err)
 	}
-	cfg.RuntimeParams["replication"] = "database"
-	cfg.RuntimeParams["client_encoding"] = "UTF8"
-	cfg.RuntimeParams["application_name"] = "walcast"
+	for name, value := range map[string]string{
+		"client_encoding":    "UTF8",
+		"application_name":   "walcast",
+		"TimeZone":           "UTC",
+		"DateStyle":          "ISO, MDY",
+		"IntervalStyle":      "postgres",
+		"extra_float_digits": "1",
+		"bytea_output":       "hex",
+	} {
+		cfg.RuntimeParams[name] = value
+	}
+	for name, value := range extra {
+		cfg.RuntimeParams[name] = value
+	}
 
 	conn, err := pgconn.ConnectConfig(ctx, cfg)
 	if err != nil {
@@ -227,13 +249,17 @@ func createSlot(ctx context.Context, conn *pgconn.PgConn, log zerolog.Logger, na
 	return nil
 }
 
-func startReplication(ctx context.Context, conn *pgconn.PgConn, slot, publication string) error {
-	err := pglogrepl.StartReplication(ctx, conn, slot, 0, pglogrepl.StartReplicationOptions{
-		PluginArgs: []string{
-			"proto_version '1'",
-			fmt.Sprintf("publication_names '%s'", publication),
-		},
-	})
+// startReplication asks for logical messages only when a backfill needs its markers: the option
+// does not exist before Postgres 14, and nothing else in walcast depends on it.
+func startReplication(ctx context.Context, conn *pgconn.PgConn, slot, publication string, messages bool) error {
+	args := []string{
+		"proto_version '1'",
+		fmt.Sprintf("publication_names '%s'", publication),
+	}
+	if messages {
+		args = append(args, "messages 'true'")
+	}
+	err := pglogrepl.StartReplication(ctx, conn, slot, 0, pglogrepl.StartReplicationOptions{PluginArgs: args})
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == sqlStateObjectNotInPrerequisiteState {
 		return fmt.Errorf("%w: %s", ErrSlotUnusable, pgErr.Message)
