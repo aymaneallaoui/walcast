@@ -297,6 +297,41 @@ func TestReplicaIdentityFullHasNoStableKey(t *testing.T) {
 	}
 }
 
+func TestIgnoredSchemaProducesNoEvents(t *testing.T) {
+	const stateRelID = usersRelID + 1
+	e := NewEncoder()
+	e.IgnoreSchema("walcast")
+	e.Relation(usersRelation())
+	state := usersRelation()
+	state.RelationID, state.Namespace, state.RelationName = stateRelID, "walcast", "slots"
+	e.Relation(state)
+	e.Begin(&pglogrepl.BeginMessage{FinalLSN: 1, Xid: 1})
+
+	row := tuple(text("7"), text("a"), text("t"), text("1"), null(), null())
+	b := &Batch{}
+	steps := map[string]func() error{
+		"insert":   func() error { return e.Insert(b, 1, &pglogrepl.InsertMessage{RelationID: stateRelID, Tuple: row}) },
+		"update":   func() error { return e.Update(b, 1, &pglogrepl.UpdateMessage{RelationID: stateRelID, NewTuple: row}) },
+		"delete":   func() error { return e.Delete(b, 1, &pglogrepl.DeleteMessage{RelationID: stateRelID, OldTuple: row}) },
+		"truncate": func() error { return e.Truncate(b, 1, &pglogrepl.TruncateMessage{RelationIDs: []uint32{stateRelID}}) },
+	}
+	for name, step := range steps {
+		if err := step(); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if b.Dirty() || b.Events != 0 {
+			t.Fatalf("%s on the state schema produced an event: %s", name, b.Buf)
+		}
+	}
+
+	if err := e.Insert(b, 1, &pglogrepl.InsertMessage{RelationID: usersRelID, Tuple: row}); err != nil {
+		t.Fatal(err)
+	}
+	if b.Events != 1 {
+		t.Fatalf("events = %d, want the public table to still stream", b.Events)
+	}
+}
+
 func TestUnknownRelationIsUnencodable(t *testing.T) {
 	e := NewEncoder()
 	err := e.Insert(&Batch{}, 1, &pglogrepl.InsertMessage{RelationID: 1, Tuple: tuple()})
