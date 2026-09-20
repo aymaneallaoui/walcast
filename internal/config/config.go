@@ -40,6 +40,7 @@ type Config struct {
 	LogFormat       string        `env:"LOG_FORMAT" envDefault:"json"`
 	DatabaseURL     string        `env:"DATABASE_URL,notEmpty"`
 	ShutdownTimeout time.Duration `env:"SHUTDOWN_TIMEOUT" envDefault:"10s"`
+	SettleTimeout   time.Duration `env:"SINK_SETTLE_TIMEOUT" envDefault:"5m"`
 
 	SlotName          string   `env:"SLOT_NAME" envDefault:"walcast_slot"`
 	PublicationName   string   `env:"PUBLICATION_NAME" envDefault:"walcast_pub"`
@@ -106,8 +107,8 @@ func (c Config) Validate() error {
 			return fmt.Errorf("invalid table %q in PUBLICATION_TABLES", t)
 		}
 	}
-	if c.ShutdownTimeout <= 0 {
-		return errors.New("SHUTDOWN_TIMEOUT must be positive")
+	if c.ShutdownTimeout <= 0 || c.SettleTimeout <= 0 {
+		return errors.New("SHUTDOWN_TIMEOUT and SINK_SETTLE_TIMEOUT must be positive")
 	}
 	if c.ServerTimeout <= c.FeedbackInterval {
 		return errors.New("SERVER_TIMEOUT must be above FEEDBACK_INTERVAL")
@@ -173,6 +174,9 @@ func (c Config) validateKafka() error {
 	switch c.KafkaSASLMechanism {
 	case "":
 	case saslPlain, saslScramSHA256, saslScramSHA512:
+		if !c.KafkaTLS {
+			return errors.New("KAFKA_TLS must be true with KAFKA_SASL_MECHANISM: a loopback broker can advertise remote ones, and credentials would follow in plaintext")
+		}
 		if c.KafkaSASLUsername == "" || c.KafkaSASLPassword == "" {
 			return errors.New("KAFKA_SASL_USERNAME and KAFKA_SASL_PASSWORD are required with KAFKA_SASL_MECHANISM")
 		}

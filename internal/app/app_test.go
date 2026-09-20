@@ -16,6 +16,7 @@ func TestRunStopsOnContextCancelWhileRetrying(t *testing.T) {
 	cfg := config.Config{
 		DatabaseURL:       "postgres://walcast@127.0.0.1:1/walcast?connect_timeout=1",
 		ShutdownTimeout:   time.Second,
+		SettleTimeout:     time.Minute,
 		SlotName:          "walcast_slot",
 		PublicationName:   "walcast_pub",
 		FeedbackInterval:  time.Second,

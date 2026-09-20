@@ -9,6 +9,7 @@ import (
 func validConfig() Config {
 	return Config{
 		ShutdownTimeout:   time.Second,
+		SettleTimeout:     time.Minute,
 		SlotName:          "walcast_slot",
 		PublicationName:   "walcast_pub",
 		FeedbackInterval:  time.Second,
@@ -166,8 +167,13 @@ func TestValidate_kafkaSink(t *testing.T) {
 			c.KafkaTLS = false
 			c.KafkaBrokers = []string{"localhost:9092", "broker.example.com:9092"}
 		},
-		"unknown sasl mechanism":      func(c *Config) { c.KafkaSASLMechanism = "gssapi" },
-		"sasl without credentials":    func(c *Config) { c.KafkaSASLMechanism = "plain" },
+		"unknown sasl mechanism":   func(c *Config) { c.KafkaSASLMechanism = "gssapi" },
+		"sasl without credentials": func(c *Config) { c.KafkaSASLMechanism = "plain" },
+		"sasl over plaintext loopback": func(c *Config) {
+			c.KafkaTLS, c.KafkaBrokers = false, []string{"localhost:9092"}
+			c.KafkaSASLMechanism, c.KafkaSASLUsername, c.KafkaSASLPassword = "plain", "u", "p"
+		},
+		"zero settle timeout":         func(c *Config) { c.SettleTimeout = 0 },
 		"topic prefix with bad chars": func(c *Config) { c.KafkaTopicPrefix = "wal cast/" },
 		"zero max message bytes":      func(c *Config) { c.KafkaMaxMessageBytes = 0 },
 		"absurd max message bytes":    func(c *Config) { c.KafkaMaxMessageBytes = 1 << 30 },
