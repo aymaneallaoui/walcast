@@ -47,11 +47,20 @@ One JSON object per line:
 
 A 2xx response means the batch is safely stored on your side: only then is its LSN confirmed to Postgres. 5xx, 408, 429 and network errors are retried forever with capped backoff (`Retry-After` is honoured in full, up to one hour, even above `WEBHOOK_RETRY_MAX`); Postgres keeps the WAL meanwhile, so set `max_slot_wal_keep_size`. Any other status, including a redirect, is a permanent rejection and stops the process rather than skipping the batch. The error names the status and your `X-Request-Id` response header if you send one; the response body is never logged, since it may echo row data. Batch boundaries can differ after a restart, so deduplicate on `commit_lsn` + `seq`, not on the idempotency key alone.
 
+`SINK=kafka` produces one record per event to the topic `KAFKA_TOPIC_PREFIX` + `schema.table`, for example `walcast.public.users`. Topics must exist unless the broker auto-creates them; a missing topic is retried with backoff until it appears.
+
+- Value: the event JSON. Key: the row's replica identity as compact JSON, for example `{"id":7}`. All changes of a row share a partition, so consumers see them in commit order.
+- Rows without a stable identity (no primary key, `REPLICA IDENTITY FULL` or `NOTHING`, truncates) are keyed by table name, which keeps them ordered in one partition.
+- An update that changes the primary key is keyed by the new value, so it can land in a different partition than the row's earlier changes.
+- The producer is idempotent with `acks=all`: broker-side retries neither duplicate nor reorder records within a partition. A replay after a restart can still duplicate, so deduplicate on `commit_lsn` + `seq`.
+- An LSN is confirmed to Postgres only after every record of its batch was acknowledged by the brokers. Errors Kafka marks non-retriable (record too large, authorization, invalid topic) stop the process.
+- TLS is required unless every broker is a loopback host. SASL `plain`, `scram-sha-256` and `scram-sha-512` are supported.
+
 ## Delivery
 
-At-least-once. A transaction's end LSN is confirmed to Postgres only after every batch holding its events, and every batch before it, has been delivered by the sink. A restart or reconnect resumes from the slot's confirmed LSN, so unconfirmed events are replayed, never lost. The stdout sink is best-effort: a successful write is treated as delivered. The webhook sink treats a 2xx response as delivered.
+At-least-once. A transaction's end LSN is confirmed to Postgres only after every batch holding its events, and every batch before it, has been delivered by the sink. A restart or reconnect resumes from the slot's confirmed LSN, so unconfirmed events are replayed, never lost. The stdout sink is best-effort: a successful write is treated as delivered. The webhook sink treats a 2xx response as delivered, the Kafka sink a broker acknowledgement of every record.
 
-Deterministic failures (an unencodable change, an unusable slot, a batch the webhook receiver rejects) stop the process instead of retrying forever.
+Deterministic failures (an unencodable change, an unusable slot, a batch the webhook receiver or Kafka rejects for good) stop the process instead of retrying forever.
 
 Large transactions are split across batches; only the batch holding the commit carries an LSN to confirm. A slow sink applies backpressure to Postgres while status updates keep flowing, so `wal_sender_timeout` does not drop the connection. Transactions are decoded with protocol version 1, so Postgres buffers a transaction until it commits.
 
@@ -75,12 +84,18 @@ Read from the environment. A `.env` file is loaded if present and never override
 | `INFLIGHT_MAX_BYTES` | `67108864` | memory bound for undelivered batches |
 | `RECONNECT_MIN_DELAY` | `500ms` | backoff floor, doubles with jitter |
 | `RECONNECT_MAX_DELAY` | `30s` | backoff cap |
-| `SINK` | `stdout` | `stdout` or `webhook` |
+| `SINK` | `stdout` | `stdout`, `webhook` or `kafka` |
 | `WEBHOOK_URL` | required for webhook | `https`, or `http` to a loopback host; no credentials in the URL |
 | `WEBHOOK_SECRET` | required for webhook | at least 16 characters, signs every request |
 | `WEBHOOK_TIMEOUT` | `10s` | per request |
 | `WEBHOOK_RETRY_MIN` | `500ms` | retry backoff floor, doubles with jitter |
 | `WEBHOOK_RETRY_MAX` | `30s` | retry backoff cap |
+| `KAFKA_BROKERS` | required for kafka | comma separated `host:port` |
+| `KAFKA_TOPIC_PREFIX` | `walcast.` | topic is prefix + `schema.table` |
+| `KAFKA_CLIENT_ID` | `walcast` | |
+| `KAFKA_TLS` | `false` | must be `true` unless every broker is a loopback host |
+| `KAFKA_SASL_MECHANISM` | none | `plain`, `scram-sha-256` or `scram-sha-512` |
+| `KAFKA_SASL_USERNAME` / `KAFKA_SASL_PASSWORD` | | required with a mechanism |
 
 ## Layout
 
@@ -90,7 +105,7 @@ internal/app           supervisor: reconnect with backoff
 internal/replication   connection, publication + slot setup, receive loop, feedback
 internal/event         pgoutput to JSON encoder, pooled batches
 internal/ledger        in-order ack tracking
-internal/sink          Sink interface, writer and webhook sinks
+internal/sink          Sink interface, writer, webhook and Kafka sinks
 internal/backoff       jittered exponential backoff
 internal/config        env config
 internal/logger        zerolog setup
