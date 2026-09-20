@@ -534,6 +534,7 @@ func TestKafkaSinkDeliversRowChangesKeyedByPrimaryKey(t *testing.T) {
 	h.exec(fmt.Sprintf("INSERT INTO %s VALUES (1, 'a', true), (2, 'b', true)", h.table))
 	h.exec(fmt.Sprintf("UPDATE %s SET name = 'a2' WHERE id = 1", h.table))
 	h.exec(fmt.Sprintf("DELETE FROM %s WHERE id = 1", h.table))
+	h.exec(fmt.Sprintf("UPDATE %s SET id = 20 WHERE id = 2", h.table))
 
 	consumer, err := kgo.NewClient(kgo.SeedBrokers(cluster.ListenAddrs()...), kgo.ConsumeTopics(topic), kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()))
 	if err != nil {
@@ -545,10 +546,11 @@ func TestKafkaSinkDeliversRowChangesKeyedByPrimaryKey(t *testing.T) {
 
 	opsByKey := map[string][]string{}
 	var lastCommit pglogrepl.LSN
-	for got := 0; got < 4; {
+	const wantRecords = 6
+	for got := 0; got < wantRecords; {
 		fetches := consumer.PollFetches(pollCtx)
 		if err := fetches.Err0(); err != nil {
-			t.Fatalf("consumed %d of 4 records: %v", got, err)
+			t.Fatalf("consumed %d of %d records: %v", got, wantRecords, err)
 		}
 		for _, r := range fetches.Records() {
 			var ev map[string]any
@@ -565,8 +567,11 @@ func TestKafkaSinkDeliversRowChangesKeyedByPrimaryKey(t *testing.T) {
 	if got := fmt.Sprint(opsByKey[`{"id":1}`]); got != "[insert update delete]" {
 		t.Errorf("row 1 saw %s, want [insert update delete] in order", got)
 	}
-	if got := fmt.Sprint(opsByKey[`{"id":2}`]); got != "[insert]" {
-		t.Errorf("row 2 saw %s, want [insert]", got)
+	if got := fmt.Sprint(opsByKey[`{"id":2}`]); got != "[insert delete]" {
+		t.Errorf("old key 2 saw %s, want [insert delete] after its primary key changed", got)
+	}
+	if got := fmt.Sprint(opsByKey[`{"id":20}`]); got != "[insert]" {
+		t.Errorf("new key 20 saw %s, want [insert]", got)
 	}
 	h.waitFor("ack after the broker confirmed the records", func() bool { return h.confirmedLSN() >= lastCommit })
 
