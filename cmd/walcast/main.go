@@ -36,18 +36,34 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	return app.New(cfg, log, newSink(cfg, log)).Run(ctx)
+	snk, err := newSink(cfg, log)
+	if err != nil {
+		return err
+	}
+	return app.New(cfg, log, snk).Run(ctx)
 }
 
-func newSink(cfg config.Config, log zerolog.Logger) sink.Sink {
-	if cfg.Sink == config.SinkWebhook {
+func newSink(cfg config.Config, log zerolog.Logger) (sink.Sink, error) {
+	switch cfg.Sink {
+	case config.SinkWebhook:
 		return sink.NewWebhook(sink.WebhookConfig{
 			URL:      cfg.WebhookURL,
 			Secret:   cfg.WebhookSecret,
 			Timeout:  cfg.WebhookTimeout,
 			RetryMin: cfg.WebhookRetryMin,
 			RetryMax: cfg.WebhookRetryMax,
+		}, log), nil
+	case config.SinkKafka:
+		return sink.NewKafka(sink.KafkaConfig{
+			Brokers:       cfg.KafkaBrokers,
+			TopicPrefix:   cfg.KafkaTopicPrefix,
+			ClientID:      cfg.KafkaClientID,
+			TLS:           cfg.KafkaTLS,
+			SASLMechanism: cfg.KafkaSASLMechanism,
+			SASLUsername:  cfg.KafkaSASLUsername,
+			SASLPassword:  cfg.KafkaSASLPassword,
 		}, log)
+	default:
+		return sink.NewWriter(os.Stdout), nil
 	}
-	return sink.NewWriter(os.Stdout)
 }
