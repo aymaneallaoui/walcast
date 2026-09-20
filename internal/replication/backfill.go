@@ -125,14 +125,15 @@ type backfillTable struct {
 func (t backfillTable) qualified() string { return t.schema + "." + t.name }
 
 type backfillWorker struct {
-	cfg        config.Config
-	log        zerolog.Logger
-	link       *backfillLink
-	conn       *pgconn.PgConn
-	systemID   string
-	generation uint64
-	chunkRows  int
-	names      []string
+	cfg           config.Config
+	log           zerolog.Logger
+	link          *backfillLink
+	conn          *pgconn.PgConn
+	systemID      string
+	generation    uint64
+	chunkRows     int
+	names         []string
+	serverVersion uint64
 }
 
 func runBackfill(ctx context.Context, cfg config.Config, log zerolog.Logger, link *backfillLink, systemID string) error {
@@ -197,6 +198,9 @@ func (w *backfillWorker) checkSource(ctx context.Context) error {
 	rows, err := w.query(ctx, "SELECT pg_is_in_recovery(), (SELECT system_identifier::text FROM pg_control_system())")
 	if err != nil {
 		return fmt.Errorf("inspect source: %w", err)
+	}
+	if w.serverVersion, err = w.scalar(ctx, "SELECT current_setting('server_version_num')"); err != nil {
+		return fmt.Errorf("inspect source: server version: %w", err)
 	}
 	if string(rows[0][0]) == "t" {
 		return fmt.Errorf("%w: the source is a standby, backfill needs a writable primary", ErrBackfillRefused)
@@ -510,13 +514,21 @@ func (w *backfillWorker) awaitResult(ctx context.Context, c *chunk) (chunkResult
 	}
 }
 
+// emit writes a marker and makes sure it is flushed. A non-transactional message is not flushed
+// when it is written, and a walsender only streams flushed WAL, so on a quiet database the marker
+// waited for the WAL writer: a fixed 204ms per chunk, whatever the chunk held. Postgres 17 can flush
+// with the message; before that, a transaction that commits right after it does the same.
 func (w *backfillWorker) emit(ctx context.Context, m marker) error {
 	m.Session = w.link.session
 	payload, err := json.Marshal(m)
 	if err != nil {
 		return fmt.Errorf("encode marker: %w", err)
 	}
-	if _, err := w.query(ctx, "SELECT pg_logical_emit_message(false, $1, $2)", markerPrefix, string(payload)); err != nil {
+	sql := "SELECT pg_logical_emit_message(false, $1, $2, true)"
+	if w.serverVersion < 170000 {
+		sql = "SELECT pg_logical_emit_message(false, $1, $2), pg_current_xact_id()"
+	}
+	if _, err := w.query(ctx, sql, markerPrefix, string(payload)); err != nil {
 		return fmt.Errorf("emit %s marker: %w", m.Kind, err)
 	}
 	return nil
