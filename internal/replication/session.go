@@ -128,9 +128,11 @@ func newSession(cfg config.Config, log zerolog.Logger, st stream) *session {
 func (s *session) run(ctx context.Context, snk sink.Sink) (pglogrepl.LSN, error) {
 	sinkCtx, cancelSink := context.WithCancel(context.Background())
 	defer cancelSink()
-	go s.dispatch(sinkCtx, snk)
+	loopCtx, stopLoop := context.WithCancel(ctx)
+	defer stopLoop()
+	go s.dispatch(sinkCtx, snk, stopLoop)
 
-	err := s.loop(ctx)
+	err := s.loop(loopCtx)
 	if err != nil {
 		s.ledger.Fail(err)
 	}
@@ -150,7 +152,9 @@ func (s *session) run(ctx context.Context, snk sink.Sink) (pglogrepl.LSN, error)
 
 // dispatch closes dispatched only once every done callback has fired, not merely when the
 // queue is empty: an asynchronous sink returns from Send long before delivery settles.
-func (s *session) dispatch(ctx context.Context, snk sink.Sink) {
+// A failed delivery calls stopLoop so the owner goroutine leaves its blocking receive at once
+// instead of noticing the failure only at the next feedback deadline.
+func (s *session) dispatch(ctx context.Context, snk sink.Sink, stopLoop context.CancelFunc) {
 	var outstanding sync.WaitGroup
 	defer func() {
 		outstanding.Wait()
@@ -166,7 +170,8 @@ func (s *session) dispatch(ctx context.Context, snk sink.Sink) {
 		snk.Send(ctx, b, func(err error) {
 			defer outstanding.Done()
 			if err != nil {
-				s.ledger.Fail(fmt.Errorf("sink: %w", err))
+				s.ledger.Fail(fmt.Errorf("deliver batch: %w", err))
+				stopLoop()
 			} else {
 				s.ledger.Done(b.Seq)
 			}
@@ -204,6 +209,9 @@ func (s *session) loop(ctx context.Context) error {
 		msg, err := s.stream.Receive(recvCtx)
 		cancel()
 		if err != nil {
+			if ledgerErr := s.ledger.Err(); ledgerErr != nil {
+				return ledgerErr
+			}
 			if ctx.Err() != nil {
 				return nil
 			}
