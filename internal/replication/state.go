@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -12,15 +13,17 @@ import (
 const (
 	stateTable = "slots"
 
-	sqlStateInsufficientPrivilege = "42501"
+	// Class 42 is "syntax error or access rule violation": missing privilege, wrong column, reserved
+	// name. The same statement fails the same way on every reconnect.
+	sqlClassAccessRuleViolation = "42"
 )
 
 var (
 	// ErrSlotLost means the state table remembers a slot that no longer exists, so every change
-	// made since it vanished is gone. It always comes wrapped with ErrSlotUnusable.
-	ErrSlotLost = errors.New("replication: slot was lost while walcast was down")
+	// made since it vanished is gone.
+	ErrSlotLost = fmt.Errorf("%w: lost while walcast was down", ErrSlotUnusable)
 
-	// ErrStateStore is fatal: a missing privilege on the state schema does not heal on reconnect.
+	// ErrStateStore is fatal: a state table that cannot be used does not heal on reconnect.
 	ErrStateStore = errors.New("replication: state store is unusable")
 )
 
@@ -29,27 +32,35 @@ type slotState struct {
 	generation int
 }
 
-// ensureStateTable refuses a schema named after the connecting role: the default search_path starts
-// with "$user", so creating it would silently capture that role's unqualified tables.
+// ensureStateTable creates the schema and table only when the table is missing. CREATE SCHEMA IF NOT
+// EXISTS checks the CREATE privilege before existence, so running it blindly would demand that
+// privilege on every start and rule out a table provisioned ahead of time for a low-privilege role.
 func ensureStateTable(ctx context.Context, conn *pgconn.PgConn, schema string) error {
-	rows, err := query(ctx, conn, "SELECT current_user")
+	rows, err := query(ctx, conn, fmt.Sprintf("SELECT current_user, to_regclass('%s.%s') IS NOT NULL", schema, stateTable))
 	if err != nil {
-		return stateError("read current role", schema, err)
+		return stateError("inspect state table", err)
 	}
-	if len(rows) == 1 && string(rows[0][0]) == schema {
+	if len(rows) != 1 {
+		return fmt.Errorf("inspect state table: got %d rows, want 1", len(rows))
+	}
+	if string(rows[0][1]) == "t" {
+		return nil
+	}
+	// The default search_path starts with "$user": a schema named after the role would silently
+	// become the default schema for that role's unqualified tables.
+	if role := string(rows[0][0]); role == schema {
 		return fmt.Errorf("%w: STATE_SCHEMA %q equals the database role, pick another name", ErrStateStore, schema)
 	}
 
 	ddl := fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS %[1]s;
 CREATE TABLE IF NOT EXISTS %[1]s.%[2]s (
 	slot_name    text PRIMARY KEY,
-	publication  text NOT NULL,
 	generation   integer NOT NULL DEFAULT 0,
 	created_at   timestamptz NOT NULL DEFAULT now(),
 	recreated_at timestamptz
 )`, schema, stateTable)
 	if _, err := conn.Exec(ctx, ddl).ReadAll(); err != nil {
-		return stateError("create state table", schema, err)
+		return stateError("create state table", err)
 	}
 	return nil
 }
@@ -58,7 +69,7 @@ func loadSlotState(ctx context.Context, conn *pgconn.PgConn, schema, slot string
 	rows, err := query(ctx, conn, fmt.Sprintf(
 		"SELECT generation FROM %s.%s WHERE slot_name = '%s'", schema, stateTable, slot))
 	if err != nil {
-		return slotState{}, stateError("read slot state", schema, err)
+		return slotState{}, stateError("read slot state", err)
 	}
 	if len(rows) == 0 {
 		return slotState{}, nil
@@ -70,30 +81,32 @@ func loadSlotState(ctx context.Context, conn *pgconn.PgConn, schema, slot string
 	return slotState{known: true, generation: generation}, nil
 }
 
-func recordSlot(ctx context.Context, conn *pgconn.PgConn, schema, slot, publication string) error {
+func recordSlot(ctx context.Context, conn *pgconn.PgConn, schema, slot string) error {
 	_, err := query(ctx, conn, fmt.Sprintf(
-		"INSERT INTO %s.%s (slot_name, publication) VALUES ('%s', '%s') ON CONFLICT (slot_name) DO NOTHING",
-		schema, stateTable, slot, publication))
+		"INSERT INTO %s.%s (slot_name) VALUES ('%s') ON CONFLICT (slot_name) DO NOTHING", schema, stateTable, slot))
 	if err != nil {
-		return stateError("record slot", schema, err)
+		return stateError("record slot", err)
 	}
 	return nil
 }
 
-func recordRecreation(ctx context.Context, conn *pgconn.PgConn, schema, slot string, generation int) error {
+// spendGeneration makes a SLOT_RECREATE_GENERATION value unusable for any later start.
+func spendGeneration(ctx context.Context, conn *pgconn.PgConn, schema, slot string, generation int, recreated bool) error {
+	stamp := ""
+	if recreated {
+		stamp = ", recreated_at = now()"
+	}
 	_, err := query(ctx, conn, fmt.Sprintf(
-		"UPDATE %s.%s SET generation = %d, recreated_at = now() WHERE slot_name = '%s'",
-		schema, stateTable, generation, slot))
+		"UPDATE %s.%s SET generation = %d%s WHERE slot_name = '%s'", schema, stateTable, generation, stamp, slot))
 	if err != nil {
-		return stateError("record slot recreation", schema, err)
+		return stateError("record slot generation", err)
 	}
 	return nil
 }
 
-func stateError(action, schema string, err error) error {
-	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok && pgErr.Code == sqlStateInsufficientPrivilege {
-		return fmt.Errorf("%w: %s: the database role needs CREATE on the database and write access to schema %s: %w",
-			ErrStateStore, action, schema, err)
+func stateError(action string, err error) error {
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok && strings.HasPrefix(pgErr.Code, sqlClassAccessRuleViolation) {
+		return fmt.Errorf("%w: %s: %w", ErrStateStore, action, err)
 	}
 	return fmt.Errorf("%s: %w", action, err)
 }
