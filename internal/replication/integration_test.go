@@ -138,6 +138,8 @@ func newHarness(t *testing.T, tune func(*config.Config)) *harness {
 			fmt.Sprintf("SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = '%s' AND active", h.cfg.SlotName),
 			fmt.Sprintf("DROP PUBLICATION IF EXISTS %s", h.cfg.PublicationName),
 			fmt.Sprintf("DROP TABLE IF EXISTS %s", h.table),
+			fmt.Sprintf("DO $$ BEGIN IF to_regclass('%[1]s.slots') IS NOT NULL THEN DELETE FROM %[1]s.slots WHERE slot_name = '%[2]s'; END IF; END $$",
+				h.cfg.StateSchema, h.cfg.SlotName),
 		} {
 			if _, err := admin.Exec(context.Background(), sql).ReadAll(); err != nil {
 				t.Errorf("cleanup %q: %v", sql, err)
