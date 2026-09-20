@@ -30,6 +30,7 @@ const (
 
 	maxIdleConns    = 4
 	idleConnTimeout = 90 * time.Second
+	maxRetryAfter   = time.Hour
 	drainLimit      = 64 << 10
 	errorBodyLimit  = 256
 )
@@ -98,7 +99,7 @@ func (w *Webhook) Send(ctx context.Context, b *event.Batch, done func(error)) {
 			return
 		}
 
-		delay := max(backoff.Delay(attempt, w.cfg.RetryMin, w.cfg.RetryMax), min(retryAfter, w.cfg.RetryMax))
+		delay := max(backoff.Delay(attempt, w.cfg.RetryMin, w.cfg.RetryMax), retryAfter)
 		w.log.Warn().Err(err).Int("attempt", attempt+1).Dur("retry_in", delay).Msg("webhook delivery failed")
 
 		timer := time.NewTimer(delay)
@@ -142,7 +143,7 @@ func (w *Webhook) post(ctx context.Context, b *event.Batch, key string, attempt 
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		return 0, nil
 	case retryable(resp.StatusCode):
-		return parseRetryAfter(resp.Header.Get("Retry-After")), fmt.Errorf("receiver answered %s", resp.Status)
+		return parseRetryAfter(resp.Header.Get("Retry-After"), w.now()), fmt.Errorf("receiver answered %s", resp.Status)
 	default:
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, errorBodyLimit))
 		return 0, fmt.Errorf("%w: %s: %s", ErrRejected, resp.Status, bytes.TrimSpace(snippet))
@@ -153,12 +154,16 @@ func retryable(status int) bool {
 	return status >= 500 || status == http.StatusRequestTimeout || status == http.StatusTooManyRequests
 }
 
-func parseRetryAfter(v string) time.Duration {
-	seconds, err := strconv.Atoi(v)
-	if err != nil || seconds <= 0 {
-		return 0
+// parseRetryAfter accepts both forms of the header. WEBHOOK_RETRY_MAX bounds only our own backoff,
+// not the receiver's request; maxRetryAfter stops a bogus value from holding Postgres WAL for days.
+func parseRetryAfter(v string, now time.Time) time.Duration {
+	var delay time.Duration
+	if seconds, err := strconv.Atoi(v); err == nil {
+		delay = time.Duration(seconds) * time.Second
+	} else if at, err := http.ParseTime(v); err == nil {
+		delay = at.Sub(now)
 	}
-	return time.Duration(seconds) * time.Second
+	return min(max(delay, 0), maxRetryAfter)
 }
 
 // Sign returns "t=<unix>,v1=<hex>" where v1 is HMAC-SHA256 over "<unix>.<body>". Binding the
