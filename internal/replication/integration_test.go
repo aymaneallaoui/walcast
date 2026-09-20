@@ -198,6 +198,15 @@ func (h *harness) confirmedLSN() pglogrepl.LSN {
 	return lsn
 }
 
+func (h *harness) currentWALLSN() pglogrepl.LSN {
+	h.t.Helper()
+	lsn, err := pglogrepl.ParseLSN(string(h.exec("SELECT pg_current_wal_lsn()")[0][0]))
+	if err != nil {
+		h.t.Fatalf("parse pg_current_wal_lsn: %v", err)
+	}
+	return lsn
+}
+
 func (h *harness) startSession() (stop func() pglogrepl.LSN) {
 	h.t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -470,11 +479,13 @@ func TestWebhookSinkSurvivesReceiverOutageWithoutLossOrEarlyAck(t *testing.T) {
 	t.Cleanup(cancel)
 	h.waitFor("slot to become active", h.slotActive)
 
-	before := h.confirmedLSN()
+	// Idle WAL ahead of the row, such as walcast's own state write, may be acked at any time. The
+	// invariant is that nothing from the row onwards is acked while the receiver rejects it.
+	before := h.currentWALLSN()
 	h.exec(fmt.Sprintf("INSERT INTO %s VALUES (1, 'during outage', true)", h.table))
 	time.Sleep(time.Second)
-	if got := h.confirmedLSN(); got != before {
-		t.Fatalf("confirmed_flush_lsn moved from %s to %s while the receiver was rejecting every request", before, got)
+	if got := h.confirmedLSN(); got > before {
+		t.Fatalf("confirmed_flush_lsn reached %s, past %s where the undelivered row starts", got, before)
 	}
 
 	mu.Lock()
