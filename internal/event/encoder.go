@@ -30,10 +30,12 @@ type column struct {
 }
 
 type relation struct {
-	name  string
-	table []byte
-	keyed bool
-	cols  []column
+	schema  string
+	relname string
+	name    string
+	table   []byte
+	keyed   bool
+	cols    []column
 }
 
 type Encoder struct {
@@ -53,9 +55,11 @@ func NewEncoder() *Encoder {
 func (e *Encoder) Relation(m *pglogrepl.RelationMessage) {
 	name := m.Namespace + "." + m.RelationName
 	rel := &relation{
-		name:  name,
-		table: appendString(nil, []byte(name)),
-		cols:  make([]column, len(m.Columns)),
+		schema:  m.Namespace,
+		relname: m.RelationName,
+		name:    name,
+		table:   appendString(nil, []byte(name)),
+		cols:    make([]column, len(m.Columns)),
 	}
 	for i, c := range m.Columns {
 		name := appendString(nil, []byte(c.Name))
@@ -87,8 +91,7 @@ func (e *Encoder) Insert(b *Batch, lsn pglogrepl.LSN, m *pglogrepl.InsertMessage
 	if err := e.tuple(b, rel, ",\"new\":", m.Tuple, false); err != nil {
 		return err
 	}
-	e.footer(b, rel, m.Tuple)
-	return nil
+	return e.footer(b, rel, m.Tuple, nil)
 }
 
 func (e *Encoder) Update(b *Batch, lsn pglogrepl.LSN, m *pglogrepl.UpdateMessage) error {
@@ -106,8 +109,7 @@ func (e *Encoder) Update(b *Batch, lsn pglogrepl.LSN, m *pglogrepl.UpdateMessage
 	if err := e.tuple(b, rel, ",\"new\":", m.NewTuple, false); err != nil {
 		return err
 	}
-	e.footer(b, rel, m.NewTuple)
-	return nil
+	return e.footer(b, rel, m.NewTuple, m.OldTuple)
 }
 
 func (e *Encoder) Delete(b *Batch, lsn pglogrepl.LSN, m *pglogrepl.DeleteMessage) error {
@@ -120,8 +122,7 @@ func (e *Encoder) Delete(b *Batch, lsn pglogrepl.LSN, m *pglogrepl.DeleteMessage
 	if err := e.tuple(b, rel, ",\"old\":", m.OldTuple, keyOnly); err != nil {
 		return err
 	}
-	e.footer(b, rel, m.OldTuple)
-	return nil
+	return e.footer(b, rel, m.OldTuple, nil)
 }
 
 func (e *Encoder) Truncate(b *Batch, lsn pglogrepl.LSN, m *pglogrepl.TruncateMessage) error {
@@ -131,7 +132,9 @@ func (e *Encoder) Truncate(b *Batch, lsn pglogrepl.LSN, m *pglogrepl.TruncateMes
 			return err
 		}
 		e.header(b, rel, opTruncate, lsn)
-		e.footer(b, rel, nil)
+		if err := e.footer(b, rel, nil, nil); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -166,7 +169,7 @@ func (e *Encoder) header(b *Batch, rel *relation, op string, lsn pglogrepl.LSN) 
 	e.unchanged = e.unchanged[:0]
 }
 
-func (e *Encoder) footer(b *Batch, rel *relation, identity *pglogrepl.TupleData) {
+func (e *Encoder) footer(b *Batch, rel *relation, identity, previous *pglogrepl.TupleData) error {
 	buf := b.Buf
 	if len(e.unchanged) > 0 {
 		buf = append(buf, ",\"unchanged\":["...)
@@ -180,8 +183,13 @@ func (e *Encoder) footer(b *Batch, rel *relation, identity *pglogrepl.TupleData)
 	}
 	buf = append(buf, '}')
 	keyStart := len(b.Keys)
-	b.Keys = appendKey(b.Keys, rel, identity)
+	keys, err := appendKey(b.Keys, rel, identity, previous)
+	if err != nil {
+		return err
+	}
+	b.Keys = keys
 	b.Records = append(b.Records, Record{
+		Schema: rel.schema, Name: rel.relname,
 		Table:      rel.name,
 		valueStart: e.recStart, valueEnd: len(buf),
 		keyStart: keyStart, keyEnd: len(b.Keys),
@@ -190,13 +198,15 @@ func (e *Encoder) footer(b *Batch, rel *relation, identity *pglogrepl.TupleData)
 	b.Buf = buf
 	b.Events++
 	e.seq++
+	return nil
 }
 
 // appendKey falls back to the table name when a row has no stable identity (no key columns,
-// REPLICA IDENTITY FULL, truncate), which keeps all such events of a table in one partition.
-func appendKey(dst []byte, rel *relation, identity *pglogrepl.TupleData) []byte {
+// REPLICA IDENTITY FULL, truncate). Postgres logs the old key when a key column is TOASTed and
+// unchanged, so previous supplies what the new tuple omits: a key is never invented.
+func appendKey(dst []byte, rel *relation, identity, previous *pglogrepl.TupleData) ([]byte, error) {
 	if !rel.keyed || identity == nil {
-		return append(dst, rel.table...)
+		return append(dst, rel.table...), nil
 	}
 	dst = append(dst, '{')
 	first := true
@@ -205,18 +215,20 @@ func appendKey(dst []byte, rel *relation, identity *pglogrepl.TupleData) []byte 
 		if !col.isKey {
 			continue
 		}
+		if c.DataType != pglogrepl.TupleDataTypeText && previous != nil && i < len(previous.Columns) {
+			c = previous.Columns[i]
+		}
+		if c.DataType != pglogrepl.TupleDataTypeText {
+			return nil, fmt.Errorf("%w: key column %s of %s has no value in the change", ErrUnencodable, col.name, rel.name)
+		}
 		if !first {
 			dst = append(dst, ',')
 		}
 		first = false
 		dst = append(dst, col.key...)
-		if c.DataType == pglogrepl.TupleDataTypeText {
-			dst = appendValue(dst, col.oid, c.Data)
-		} else {
-			dst = append(dst, "null"...)
-		}
+		dst = appendValue(dst, col.oid, c.Data)
 	}
-	return append(dst, '}')
+	return append(dst, '}'), nil
 }
 
 func (e *Encoder) tuple(b *Batch, rel *relation, field string, t *pglogrepl.TupleData, keyOnly bool) error {
