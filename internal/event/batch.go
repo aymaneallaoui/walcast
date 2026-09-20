@@ -14,6 +14,7 @@ const (
 // Record locates one event inside a Batch. Value excludes the trailing newline and Key is the
 // row's replica identity as compact JSON, or the quoted table name when the row has none.
 type Record struct {
+	Op                   string
 	Schema, Name         string
 	Table                string
 	valueStart, valueEnd int
