@@ -204,6 +204,64 @@ func TestNewKafka_rejectsUnknownSASLMechanism(t *testing.T) {
 	}
 }
 
+func TestKafka_SendTruncates(t *testing.T) {
+	const topic = "walcast.public.users"
+	batch := func(t *testing.T) *event.Batch {
+		enc, b := newEncoder(), &event.Batch{}
+		if err := enc.Truncate(b, 1, &pglogrepl.TruncateMessage{RelationIDs: []uint32{usersRel}}); err != nil {
+			t.Fatal(err)
+		}
+		insert(t, enc, b, usersRel, 1, "after truncate")
+		return b
+	}
+	newSink := func(t *testing.T, emit bool) (*Kafka, *kfake.Cluster) {
+		cluster, err := kfake.NewCluster(kfake.SeedTopics(1, topic))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(cluster.Close)
+		snk, err := NewKafka(KafkaConfig{Brokers: cluster.ListenAddrs(), TopicPrefix: "walcast.", ClientID: "t", EmitTruncate: emit}, zerolog.Nop())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = snk.Close() })
+		return snk, cluster
+	}
+
+	t.Run("skipped by default, the rest of the batch is delivered", func(t *testing.T) {
+		snk, cluster := newSink(t, false)
+		if err := sendKafka(t, context.Background(), snk, batch(t)); err != nil {
+			t.Fatal(err)
+		}
+		got := consume(t, cluster, 1, topic)
+		if len(got) != 1 || !bytes.Contains(got[0].Value, []byte(`"op":"insert"`)) {
+			t.Fatalf("got %d records, first %s", len(got), got[0].Value)
+		}
+	})
+
+	t.Run("a batch of only truncates is acknowledged", func(t *testing.T) {
+		snk, _ := newSink(t, false)
+		enc, b := newEncoder(), &event.Batch{}
+		if err := enc.Truncate(b, 1, &pglogrepl.TruncateMessage{RelationIDs: []uint32{usersRel}}); err != nil {
+			t.Fatal(err)
+		}
+		if err := sendKafka(t, context.Background(), snk, b); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("sent when enabled, keyed by table", func(t *testing.T) {
+		snk, cluster := newSink(t, true)
+		if err := sendKafka(t, context.Background(), snk, batch(t)); err != nil {
+			t.Fatal(err)
+		}
+		got := consume(t, cluster, 2, topic)
+		if string(got[0].Key) != `"public.users"` || !bytes.Contains(got[0].Value, []byte(`"op":"truncate"`)) {
+			t.Fatalf("first record key=%s value=%s", got[0].Key, got[0].Value)
+		}
+	})
+}
+
 func TestTopicName(t *testing.T) {
 	tests := []struct {
 		name, prefix, schema, table string

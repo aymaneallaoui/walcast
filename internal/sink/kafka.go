@@ -49,6 +49,7 @@ type KafkaConfig struct {
 	SASLUsername    string
 	SASLPassword    string
 	MaxMessageBytes int32
+	EmitTruncate    bool
 	ClientOptions   []kgo.Opt
 }
 
@@ -59,6 +60,8 @@ type Kafka struct {
 	prefix string
 	log    zerolog.Logger
 	topics map[tableID]string
+
+	emitTruncate bool
 }
 
 func NewKafka(cfg KafkaConfig, log zerolog.Logger) (*Kafka, error) {
@@ -89,7 +92,7 @@ func NewKafka(cfg KafkaConfig, log zerolog.Logger) (*Kafka, error) {
 	if err := client.Ping(pingCtx); err != nil {
 		log.Warn().Err(err).Strs("brokers", cfg.Brokers).Msg("kafka brokers unreachable at startup, deliveries will retry")
 	}
-	return &Kafka{client: client, prefix: cfg.TopicPrefix, log: log, topics: make(map[tableID]string)}, nil
+	return &Kafka{client: client, prefix: cfg.TopicPrefix, log: log, topics: make(map[tableID]string), emitTruncate: cfg.EmitTruncate}, nil
 }
 
 func saslMechanism(cfg KafkaConfig) (sasl.Mechanism, error) {
@@ -110,16 +113,24 @@ func saslMechanism(cfg KafkaConfig) (sasl.Mechanism, error) {
 // Send returns once every record is buffered; done fires after the last produce callback. The
 // method value is bound once: binding it per record cost one allocation per event (measured).
 func (k *Kafka) Send(ctx context.Context, b *event.Batch, done func(error)) {
-	if len(b.Records) == 0 {
+	records := make([]kgo.Record, 0, len(b.Records))
+	for _, r := range b.Records {
+		// A truncate is keyed by table while rows are keyed by identity, so a consumer can read it
+		// after a later insert from another partition and wipe that new row.
+		if r.Op == event.OpTruncate && !k.emitTruncate {
+			k.log.Warn().Str("table", r.Table).Msg("truncate not sent to kafka, set KAFKA_EMIT_TRUNCATE=true to send it")
+			continue
+		}
+		records = append(records, kgo.Record{Topic: k.topic(r.Schema, r.Name), Key: b.Key(r), Value: b.Value(r)})
+	}
+	if len(records) == 0 {
 		done(nil)
 		return
 	}
 
-	pending := &produceGroup{remaining: len(b.Records), done: done}
+	pending := &produceGroup{remaining: len(records), done: done}
 	settle := pending.settle
-	records := make([]kgo.Record, len(b.Records))
-	for i, r := range b.Records {
-		records[i] = kgo.Record{Topic: k.topic(r.Schema, r.Name), Key: b.Key(r), Value: b.Value(r)}
+	for i := range records {
 		k.client.Produce(ctx, &records[i], settle)
 	}
 }
