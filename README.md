@@ -14,7 +14,7 @@ make up     # Postgres with wal_level=logical
 make run    # events on stdout, logs on stderr, Ctrl+C for graceful shutdown
 ```
 
-Other targets: `make build`, `make test`, `make test-integration` (needs `DATABASE_URL`, read from `.env`), `make bench`, `make fuzz`, `make vuln`, `make lint`, `make fmt`, `make down`. If port 5432 is taken, set `POSTGRES_PORT` in `.env` and match it in `DATABASE_URL`.
+Other targets: `make build`, `make test`, `make test-integration` (uses `DATABASE_URL` from `.env` when set, otherwise starts its own Postgres container and needs only Docker), `make bench`, `make fuzz`, `make vuln`, `make lint`, `make fmt`, `make down`. If port 5432 is taken, set `POSTGRES_PORT` in `.env` and match it in `DATABASE_URL`.
 
 The publication and the replication slot are created on first start if missing. An existing publication is never altered; a mismatch with `PUBLICATION_TABLES` is logged. If the slot disappears or is invalidated while walcast runs, it exits instead of recreating it, because a fresh slot would silently skip every change made in between.
 
