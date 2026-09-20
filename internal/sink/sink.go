@@ -14,8 +14,8 @@ var ErrRejected = errors.New("sink: batch rejected")
 // ErrWriterBusy means an earlier write is still blocked, for instance on a pipe nobody reads.
 var ErrWriterBusy = errors.New("sink: previous write has not returned")
 
-// Sink delivers batches. done must be called exactly once per Send, with nil only when the
-// batch is as durable as the sink can make it; Send must give up once ctx is cancelled.
+// Sink delivers batches: Send is never called concurrently and must give up once ctx is cancelled.
+// done must be called exactly once per Send, with nil only when the batch is as durable as it gets.
 type Sink interface {
 	Send(ctx context.Context, b *event.Batch, done func(error))
 	Close() error
