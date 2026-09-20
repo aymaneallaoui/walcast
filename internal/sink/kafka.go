@@ -1,12 +1,14 @@
 package sink
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"regexp"
 	"sync"
 	"time"
 
@@ -29,8 +31,14 @@ const (
 	kafkaPingTimeout  = 5 * time.Second
 	maxTopicLen       = 249
 	topicHashLen      = 4
-	maxLoggedKeyLen   = 64
 )
+
+var (
+	generatedTopicRE = regexp.MustCompile(`-[0-9a-f]{8}$`)
+	eventHeaderEnd   = []byte(`,"ts":`)
+)
+
+type tableID struct{ schema, name string }
 
 type KafkaConfig struct {
 	Brokers         []string
@@ -50,7 +58,7 @@ type Kafka struct {
 	client *kgo.Client
 	prefix string
 	log    zerolog.Logger
-	topics map[string]string
+	topics map[tableID]string
 }
 
 func NewKafka(cfg KafkaConfig, log zerolog.Logger) (*Kafka, error) {
@@ -81,7 +89,7 @@ func NewKafka(cfg KafkaConfig, log zerolog.Logger) (*Kafka, error) {
 	if err := client.Ping(pingCtx); err != nil {
 		log.Warn().Err(err).Strs("brokers", cfg.Brokers).Msg("kafka brokers unreachable at startup, deliveries will retry")
 	}
-	return &Kafka{client: client, prefix: cfg.TopicPrefix, log: log, topics: make(map[string]string)}, nil
+	return &Kafka{client: client, prefix: cfg.TopicPrefix, log: log, topics: make(map[tableID]string)}, nil
 }
 
 func saslMechanism(cfg KafkaConfig) (sasl.Mechanism, error) {
@@ -111,7 +119,7 @@ func (k *Kafka) Send(ctx context.Context, b *event.Batch, done func(error)) {
 	settle := pending.settle
 	records := make([]kgo.Record, len(b.Records))
 	for i, r := range b.Records {
-		records[i] = kgo.Record{Topic: k.topic(r.Table), Key: b.Key(r), Value: b.Value(r)}
+		records[i] = kgo.Record{Topic: k.topic(r.Schema, r.Name), Key: b.Key(r), Value: b.Value(r)}
 		k.client.Produce(ctx, &records[i], settle)
 	}
 }
@@ -124,35 +132,40 @@ func (k *Kafka) Close() error {
 	return err
 }
 
-func (k *Kafka) topic(table string) string {
-	topic, ok := k.topics[table]
+func (k *Kafka) topic(schema, name string) string {
+	id := tableID{schema, name}
+	topic, ok := k.topics[id]
 	if !ok {
-		topic = topicName(k.prefix, table)
-		if topic != k.prefix+table {
-			k.log.Warn().Str("table", table).Str("topic", topic).Msg("table name is not a legal kafka topic, using a sanitised name")
+		topic = topicName(k.prefix, schema, name)
+		if topic != k.prefix+schema+"."+name {
+			k.log.Warn().Str("schema", schema).Str("table", name).Str("topic", topic).Msg("table name is not a legal kafka topic, using a sanitised name")
 		}
-		k.topics[table] = topic
+		k.topics[id] = topic
 	}
 	return topic
 }
 
-// topicName keeps legal names untouched. Anything else (quoted identifiers, names over Kafka's
-// 249 byte limit) is sanitised and gets a hash suffix so two different tables can never collide.
-func topicName(prefix, table string) string {
-	name := prefix + table
-	legal := len(name) <= maxTopicLen && name != "." && name != ".."
-	sanitised := []byte(name)
+// topicName keeps prefix.schema.table untouched only when that mapping cannot be ambiguous. Dots
+// inside an identifier, illegal bytes, over 249 bytes, or a name shaped like a generated one get
+// sanitised plus a hash of the exact (schema, table) pair, so distinct tables never share a topic.
+func topicName(prefix, schema, name string) string {
+	full := prefix + schema + "." + name
+	plain := len(full) <= maxTopicLen && !generatedTopicRE.MatchString(full)
+	for _, part := range [2]string{schema, name} {
+		plain = plain && part != "" && !bytes.ContainsRune([]byte(part), '.')
+	}
+	sanitised := []byte(full)
 	for i, c := range sanitised {
 		if !legalTopicByte(c) {
 			sanitised[i] = '_'
-			legal = false
+			plain = false
 		}
 	}
-	if legal {
-		return name
+	if plain {
+		return full
 	}
 
-	sum := sha256.Sum256([]byte(name))
+	sum := sha256.Sum256([]byte(prefix + "\x00" + schema + "\x00" + name))
 	suffix := "-" + hex.EncodeToString(sum[:topicHashLen])
 	return string(sanitised[:min(len(sanitised), maxTopicLen-len(suffix))]) + suffix
 }
@@ -168,19 +181,33 @@ type produceGroup struct {
 	done      func(error)
 }
 
+// settle keeps the first fatal error in preference to the first error: a transient failure on
+// one record must not hide an authorization failure on another and turn a stop into a replay.
 func (g *produceGroup) settle(r *kgo.Record, err error) {
+	if err != nil {
+		err = classifyKafkaError(fmt.Errorf("produce to %s, %d byte value, event %s: %w", r.Topic, len(r.Value), eventHeader(r.Value), err))
+	}
+
 	g.mu.Lock()
-	if err != nil && g.err == nil {
-		key := r.Key[:min(len(r.Key), maxLoggedKeyLen)]
-		g.err = fmt.Errorf("produce to %s, key %s, %d byte value: %w", r.Topic, key, len(r.Value), err)
+	if err != nil && (g.err == nil || errors.Is(err, ErrRejected) && !errors.Is(g.err, ErrRejected)) {
+		g.err = err
 	}
 	g.remaining--
-	finished, first := g.remaining == 0, g.err
+	finished, final := g.remaining == 0, g.err
 	g.mu.Unlock()
 
 	if finished {
-		g.done(classifyKafkaError(first))
+		g.done(final)
 	}
+}
+
+// eventHeader returns the event's leading fields (table, op, lsn, commit_lsn, seq, txid), which
+// locate it exactly. The row key and row data stay out of errors because they can hold PII.
+func eventHeader(value []byte) []byte {
+	if i := bytes.Index(value, eventHeaderEnd); i > 0 {
+		return append(value[:i:i], '}')
+	}
+	return []byte("{}")
 }
 
 // classifyKafkaError marks broker errors Kafka itself calls non-retriable (record too large,
