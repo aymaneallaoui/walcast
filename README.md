@@ -45,7 +45,7 @@ One JSON object per line:
 | `X-Walcast-Events` | Number of events in the body. |
 | `X-Walcast-Attempt` | 1 for the first try. |
 
-A 2xx response means the batch is safely stored on your side: only then is its LSN confirmed to Postgres. 5xx, 408, 429 and network errors are retried forever with capped backoff (`Retry-After` is honoured in full, up to one hour, even above `WEBHOOK_RETRY_MAX`); Postgres keeps the WAL meanwhile, so set `max_slot_wal_keep_size`. Any other status, including a redirect, is a permanent rejection and stops the process rather than skipping the batch. Batch boundaries can differ after a restart, so deduplicate on `commit_lsn` + `seq`, not on the idempotency key alone.
+A 2xx response means the batch is safely stored on your side: only then is its LSN confirmed to Postgres. 5xx, 408, 429 and network errors are retried forever with capped backoff (`Retry-After` is honoured in full, up to one hour, even above `WEBHOOK_RETRY_MAX`); Postgres keeps the WAL meanwhile, so set `max_slot_wal_keep_size`. Any other status, including a redirect, is a permanent rejection and stops the process rather than skipping the batch. The error names the status and your `X-Request-Id` response header if you send one; the response body is never logged, since it may echo row data. Batch boundaries can differ after a restart, so deduplicate on `commit_lsn` + `seq`, not on the idempotency key alone.
 
 ## Delivery
 

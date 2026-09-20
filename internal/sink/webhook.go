@@ -25,6 +25,7 @@ const (
 	HeaderIdempotencyKey = "X-Walcast-Idempotency-Key"
 	HeaderEvents         = "X-Walcast-Events"
 	HeaderAttempt        = "X-Walcast-Attempt"
+	headerRequestID      = "X-Request-Id"
 
 	contentTypeNDJSON = "application/x-ndjson"
 	userAgent         = "walcast"
@@ -33,7 +34,7 @@ const (
 	idleConnTimeout = 90 * time.Second
 	maxRetryAfter   = time.Hour
 	drainLimit      = 64 << 10
-	errorBodyLimit  = 256
+	maxRequestIDLen = 64
 )
 
 // ErrRejected means the receiver refused the batch for good: retrying the same bytes cannot help.
@@ -56,6 +57,7 @@ type Webhook struct {
 	client *http.Client
 	log    zerolog.Logger
 	now    func() time.Time
+	body   []byte
 }
 
 func NewWebhook(cfg WebhookConfig, log zerolog.Logger) *Webhook {
@@ -82,12 +84,21 @@ func (w *Webhook) Send(ctx context.Context, b *event.Batch, done func(error)) {
 		return
 	}
 
-	digest := sha256.Sum256(b.Buf)
+	// net/http may keep reading a request body after a cancelled or failed round trip, while the
+	// batch goes back to the pool right after done. So requests read a private copy, never b.Buf.
+	body := w.body[:0]
+	body = append(body, b.Buf...)
+	w.body = nil
+	digest := sha256.Sum256(body)
 	key := hex.EncodeToString(digest[:16])
 
 	for attempt := 0; ; attempt++ {
-		retryAfter, err := w.post(ctx, b, key, attempt)
+		retryAfter, settled, err := w.post(ctx, body, b.Events, key, attempt)
+		if !settled {
+			body = bytes.Clone(body)
+		}
 		if err == nil {
+			w.body = body
 			done(nil)
 			return
 		}
@@ -119,36 +130,44 @@ func (w *Webhook) Close() error {
 	return nil
 }
 
-func (w *Webhook) post(ctx context.Context, b *event.Batch, key string, attempt int) (retryAfter time.Duration, err error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.cfg.URL, bytes.NewReader(b.Buf))
+// post reports settled once the response body is closed: only then has the transport let go of body.
+func (w *Webhook) post(ctx context.Context, body []byte, events int, key string, attempt int) (retryAfter time.Duration, settled bool, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.cfg.URL, bytes.NewReader(body))
 	if err != nil {
-		return 0, fmt.Errorf("%w: build request: %w", ErrRejected, err)
+		return 0, true, fmt.Errorf("%w: build request: %w", ErrRejected, err)
 	}
 	req.Header.Set("Content-Type", contentTypeNDJSON)
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set(HeaderIdempotencyKey, key)
-	req.Header.Set(HeaderEvents, strconv.Itoa(b.Events))
+	req.Header.Set(HeaderEvents, strconv.Itoa(events))
 	req.Header.Set(HeaderAttempt, strconv.Itoa(attempt+1))
-	req.Header.Set(HeaderSignature, Sign(w.secret, w.now(), b.Buf))
+	req.Header.Set(HeaderSignature, Sign(w.secret, w.now(), body))
 
 	resp, err := w.client.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("post: %w", withoutURL(err))
+		return 0, false, fmt.Errorf("post: %w", withoutURL(err))
 	}
-	defer func() {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, drainLimit))
-		_ = resp.Body.Close()
-	}()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, drainLimit))
+	_ = resp.Body.Close()
 
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
-		return 0, nil
+		return 0, true, nil
 	case retryable(resp.StatusCode):
-		return parseRetryAfter(resp.Header.Get("Retry-After"), w.now()), fmt.Errorf("receiver answered %s", resp.Status)
+		return parseRetryAfter(resp.Header.Get("Retry-After"), w.now()), true, fmt.Errorf("receiver answered %s", resp.Status)
 	default:
-		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, errorBodyLimit))
-		return 0, fmt.Errorf("%w: %s: %s", ErrRejected, resp.Status, bytes.TrimSpace(snippet))
+		return 0, true, fmt.Errorf("%w: receiver answered %s%s", ErrRejected, resp.Status, requestID(resp.Header))
 	}
+}
+
+// requestID is the only receiver-controlled text allowed into errors: a response body can echo
+// row data, and these errors reach logs and stderr.
+func requestID(h http.Header) string {
+	id := h.Get(headerRequestID)
+	if id == "" {
+		return ""
+	}
+	return " (request id " + strconv.QuoteToASCII(id[:min(len(id), maxRequestIDLen)]) + ")"
 }
 
 // withoutURL drops the request URL that net/http puts in its errors: these errors are logged on
@@ -168,8 +187,8 @@ func retryable(status int) bool {
 // not the receiver's request; maxRetryAfter stops a bogus value from holding Postgres WAL for days.
 func parseRetryAfter(v string, now time.Time) time.Duration {
 	var delay time.Duration
-	if seconds, err := strconv.Atoi(v); err == nil {
-		delay = time.Duration(seconds) * time.Second
+	if seconds, err := strconv.ParseInt(v, 10, 64); err == nil {
+		delay = time.Duration(min(max(seconds, 0), int64(maxRetryAfter/time.Second))) * time.Second
 	} else if at, err := http.ParseTime(v); err == nil {
 		delay = at.Sub(now)
 	}
