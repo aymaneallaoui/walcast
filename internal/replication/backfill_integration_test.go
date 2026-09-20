@@ -27,8 +27,13 @@ func backfillOf(rows, bytes int) func(*config.Config) {
 	}
 }
 
+// backfillStatus tolerates a missing table: walcast creates it on the first backfill, and a test
+// that polls right after starting a session must not depend on an earlier test having done so.
 func (h *harness) backfillStatus() (status string, rows int) {
 	h.t.Helper()
+	if exists := h.exec(fmt.Sprintf("SELECT to_regclass('%s.backfills') IS NOT NULL", h.cfg.StateSchema)); string(exists[0][0]) != "t" {
+		return "", 0
+	}
 	got := h.exec(fmt.Sprintf("SELECT status, rows_emitted FROM %s.backfills WHERE table_name = 'public.%s'", h.cfg.StateSchema, h.table))
 	if len(got) != 1 {
 		return "", 0
@@ -253,6 +258,9 @@ func TestBackfillRefusesWhatItCannotDoCorrectly(t *testing.T) {
 			h.exec(fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE %s WITH (publish = 'insert, update')", h.cfg.PublicationName, h.table))
 		}, "must publish"},
 		{"row filter", func(h *harness) {
+			if version, _ := strconv.Atoi(string(h.exec("SHOW server_version_num")[0][0])); version < 150000 {
+				h.t.Skip("row filters exist from Postgres 15 on")
+			}
 			h.exec(fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE %s WHERE (active)", h.cfg.PublicationName, h.table))
 		}, "filters"},
 		{"row-level security", func(h *harness) {
