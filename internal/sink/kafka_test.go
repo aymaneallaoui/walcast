@@ -205,27 +205,26 @@ func TestNewKafka_rejectsUnknownSASLMechanism(t *testing.T) {
 }
 
 func TestTopicName(t *testing.T) {
-	long := strings.Repeat("a", 63) + "." + strings.Repeat("b", 63)
 	tests := []struct {
-		name, prefix, table string
-		check               func(t *testing.T, topic string)
+		name, prefix, schema, table string
+		check                       func(t *testing.T, topic string)
 	}{
-		{"legal name is untouched", "walcast.", "public.users", func(t *testing.T, topic string) {
+		{"plain name is untouched", "walcast.", "public", "users", func(t *testing.T, topic string) {
 			if topic != "walcast.public.users" {
 				t.Fatalf("topic = %q", topic)
 			}
 		}},
-		{"quoted identifier is sanitised and hashed", "walcast.", "public.my table", func(t *testing.T, topic string) {
+		{"quoted identifier is sanitised and hashed", "walcast.", "public", "my table", func(t *testing.T, topic string) {
 			if !strings.HasPrefix(topic, "walcast.public.my_table-") || len(topic) != len("walcast.public.my_table-")+8 {
 				t.Fatalf("topic = %q", topic)
 			}
 		}},
-		{"overlong name is cut to the limit", strings.Repeat("p", 124), long, func(t *testing.T, topic string) {
+		{"overlong name is cut to the limit", strings.Repeat("p", 124), strings.Repeat("a", 63), strings.Repeat("b", 63), func(t *testing.T, topic string) {
 			if len(topic) != maxTopicLen {
 				t.Fatalf("len = %d, want %d", len(topic), maxTopicLen)
 			}
 		}},
-		{"non ascii bytes become underscores", "", "public.café", func(t *testing.T, topic string) {
+		{"non ascii bytes become underscores", "", "public", "café", func(t *testing.T, topic string) {
 			for i := range len(topic) {
 				if !legalTopicByte(topic[i]) {
 					t.Fatalf("illegal byte in %q", topic)
@@ -234,30 +233,63 @@ func TestTopicName(t *testing.T) {
 		}},
 	}
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) { tt.check(t, topicName(tt.prefix, tt.table)) })
+		t.Run(tt.name, func(t *testing.T) { tt.check(t, topicName(tt.prefix, tt.schema, tt.table)) })
 	}
 
-	if a, b := topicName("", "public.my table"), topicName("", "public.my_table"); a == b {
-		t.Fatalf("different tables collide on %q", a)
+	distinct := [][2][2]string{
+		{{"public", "my table"}, {"public", "my_table"}},
+		{{"a.b", "c"}, {"a", "b.c"}},
+		{{"public", "my table"}, {"public", strings.TrimPrefix(topicName("walcast.", "public", "my table"), "walcast.public.")}},
 	}
-	if a, b := topicName("", "public.my table"), topicName("", "public.my table"); a != b {
+	for _, pair := range distinct {
+		a, b := topicName("walcast.", pair[0][0], pair[0][1]), topicName("walcast.", pair[1][0], pair[1][1])
+		if a == b {
+			t.Errorf("tables %q and %q collide on topic %q", pair[0], pair[1], a)
+		}
+	}
+	if a, b := topicName("", "public", "my table"), topicName("", "public", "my table"); a != b {
 		t.Fatalf("topic name is not stable: %q vs %q", a, b)
 	}
 }
 
-func TestProduceGroup_firstErrorNamesTheRecord(t *testing.T) {
-	var got error
-	g := &produceGroup{remaining: 2, done: func(err error) { got = err }}
-	g.settle(&kgo.Record{Topic: "walcast.public.docs", Key: []byte(`{"id":7}`), Value: make([]byte, 2<<20)}, kerr.MessageTooLarge)
-	g.settle(&kgo.Record{Topic: "walcast.public.docs"}, nil)
-
-	if !errors.Is(got, ErrRejected) || !errors.Is(got, kerr.MessageTooLarge) {
-		t.Fatalf("err = %v, want a rejection wrapping MESSAGE_TOO_LARGE", got)
+func TestProduceGroup_settle(t *testing.T) {
+	const value = `{"table":"public.docs","op":"insert","lsn":"0/1","commit_lsn":"0/2","seq":3,"txid":9,"ts":"2026-09-20T10:00:00Z","new":{"email":"jane@example.com"}}`
+	record := func() *kgo.Record {
+		return &kgo.Record{Topic: "walcast.public.docs", Key: []byte(`{"email":"jane@example.com"}`), Value: []byte(value)}
 	}
-	for _, want := range []string{"walcast.public.docs", `{"id":7}`, "2097152 byte"} {
-		if !strings.Contains(got.Error(), want) {
-			t.Fatalf("error %q does not mention %q", got, want)
+
+	t.Run("error locates the event without leaking the row", func(t *testing.T) {
+		var got error
+		g := &produceGroup{remaining: 2, done: func(err error) { got = err }}
+		g.settle(record(), kerr.MessageTooLarge)
+		g.settle(record(), nil)
+
+		if !errors.Is(got, ErrRejected) || !errors.Is(got, kerr.MessageTooLarge) {
+			t.Fatalf("err = %v, want a rejection wrapping MESSAGE_TOO_LARGE", got)
 		}
+		for _, want := range []string{"walcast.public.docs", `"commit_lsn":"0/2"`, `"seq":3`, fmt.Sprint(len(value)) + " byte"} {
+			if !strings.Contains(got.Error(), want) {
+				t.Errorf("error %q does not mention %q", got, want)
+			}
+		}
+		if strings.Contains(got.Error(), "jane@example.com") {
+			t.Fatalf("error leaks row data: %v", got)
+		}
+	})
+
+	for name, order := range map[string][2]error{
+		"fatal after transient":  {kerr.NotLeaderForPartition, kerr.TopicAuthorizationFailed},
+		"fatal before transient": {kerr.TopicAuthorizationFailed, kerr.NotLeaderForPartition},
+	} {
+		t.Run("fatal error wins, "+name, func(t *testing.T) {
+			var got error
+			g := &produceGroup{remaining: 2, done: func(err error) { got = err }}
+			g.settle(record(), order[0])
+			g.settle(record(), order[1])
+			if !errors.Is(got, ErrRejected) || !errors.Is(got, kerr.TopicAuthorizationFailed) {
+				t.Fatalf("err = %v, want the authorization failure as a rejection", got)
+			}
+		})
 	}
 }
 
