@@ -1,23 +1,38 @@
-package app_test
+package app
 
 import (
 	"context"
+	"io"
 	"testing"
 	"time"
 
 	"github.com/rs/zerolog"
 
-	"github.com/aymaneallaoui/walcast/internal/app"
 	"github.com/aymaneallaoui/walcast/internal/config"
+	"github.com/aymaneallaoui/walcast/internal/sink"
 )
 
-func TestRunStopsOnContextCancel(t *testing.T) {
+func TestRunStopsOnContextCancelWhileRetrying(t *testing.T) {
+	cfg := config.Config{
+		DatabaseURL:       "postgres://walcast@127.0.0.1:1/walcast?connect_timeout=1",
+		ShutdownTimeout:   time.Second,
+		SlotName:          "walcast_slot",
+		PublicationName:   "walcast_pub",
+		FeedbackInterval:  time.Second,
+		ServerTimeout:     time.Minute,
+		BatchMaxBytes:     1 << 16,
+		BatchLinger:       time.Millisecond,
+		InflightMaxBytes:  1 << 20,
+		ReconnectMinDelay: 10 * time.Millisecond,
+		ReconnectMaxDelay: 50 * time.Millisecond,
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-	a := app.New(config.Config{ShutdownTimeout: time.Second}, zerolog.Nop())
+	a := New(cfg, zerolog.Nop(), sink.NewWriter(io.Discard))
 
 	done := make(chan error, 1)
 	go func() { done <- a.Run(ctx) }()
 
+	time.Sleep(100 * time.Millisecond)
 	cancel()
 
 	select {
@@ -25,7 +40,7 @@ func TestRunStopsOnContextCancel(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Run returned error: %v", err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after context cancel")
 	}
 }

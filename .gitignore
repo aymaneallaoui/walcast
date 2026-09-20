@@ -3,6 +3,13 @@
 *.test
 *.out
 coverage.*
+bench.txt
 .idea/
 .vscode/
 .DS_Store
+
+# local agent tooling
+.agents/
+.claude/
+.serena/
+skills-lock.json

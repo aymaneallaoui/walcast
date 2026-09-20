@@ -10,6 +10,7 @@ import (
 	"github.com/aymaneallaoui/walcast/internal/app"
 	"github.com/aymaneallaoui/walcast/internal/config"
 	"github.com/aymaneallaoui/walcast/internal/logger"
+	"github.com/aymaneallaoui/walcast/internal/sink"
 )
 
 func main() {
@@ -25,7 +26,7 @@ func run() error {
 		return err
 	}
 
-	log, err := logger.New(os.Stdout, cfg.LogLevel, cfg.LogFormat)
+	log, err := logger.New(os.Stderr, cfg.LogLevel, cfg.LogFormat)
 	if err != nil {
 		return err
 	}
@@ -33,5 +34,5 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	return app.New(cfg, log).Run(ctx)
+	return app.New(cfg, log, sink.NewWriter(os.Stdout)).Run(ctx)
 }
