@@ -374,6 +374,22 @@ func TestSession_run(t *testing.T) {
 		}
 	})
 
+	t.Run("fatal delivery error survives an earlier connection error", func(t *testing.T) {
+		snk := &asyncSink{}
+		st := newFakeStream(committedInsert()...)
+		_, result := startSession(t, testConfig(), st, snk)
+
+		eventually(t, "sink to hold the batch", func() bool { return snk.held() == 1 })
+		connErr := errors.New("connection reset")
+		st.errs <- connErr
+		time.Sleep(20 * time.Millisecond)
+		snk.settle(sink.ErrRejected)
+
+		if _, err := result(); !errors.Is(err, connErr) || !errors.Is(err, sink.ErrRejected) {
+			t.Fatalf("err = %v, want the connection error and the rejection", err)
+		}
+	})
+
 	t.Run("drain gives up on a stuck sink and cancels it", func(t *testing.T) {
 		cfg := testConfig()
 		cfg.ShutdownTimeout = 50 * time.Millisecond

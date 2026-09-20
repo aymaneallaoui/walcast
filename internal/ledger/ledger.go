@@ -1,6 +1,7 @@
 package ledger
 
 import (
+	"errors"
 	"sync"
 	"sync/atomic"
 
@@ -67,10 +68,12 @@ func (l *Ledger) Done(seq uint64) {
 	l.signal()
 }
 
+// Fail keeps every distinct failure, not just the first: a fatal delivery error that lands after
+// a connection error must still reach the supervisor, or it would reconnect instead of stopping.
 func (l *Ledger) Fail(err error) {
 	l.mu.Lock()
-	if l.err == nil {
-		l.err = err
+	if !errors.Is(l.err, err) {
+		l.err = errors.Join(l.err, err)
 	}
 	l.mu.Unlock()
 	l.signal()

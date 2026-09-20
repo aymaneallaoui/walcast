@@ -144,8 +144,8 @@ func (s *session) run(ctx context.Context, snk sink.Sink) (pglogrepl.LSN, error)
 	if statusErr := s.sendStatus(); statusErr != nil && err == nil {
 		s.log.Warn().Err(statusErr).Msg("final status update failed")
 	}
-	if err == nil {
-		err = s.ledger.Err()
+	if ledgerErr := s.ledger.Err(); ledgerErr != nil {
+		err = ledgerErr
 	}
 	return s.ledger.Flushed(), err
 }
