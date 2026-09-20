@@ -3,6 +3,7 @@ module github.com/aymaneallaoui/walcast
 go 1.27.1
 
 require (
+	github.com/VictoriaMetrics/metrics v1.44.0
 	github.com/caarlos0/env/v11 v11.4.1
 	github.com/jackc/pglogrepl v0.0.0-20260824121319-4ae5c490f7ce
 	github.com/jackc/pgx/v5 v5.11.0
@@ -64,6 +65,8 @@ require (
 	github.com/tklauser/go-sysconf v0.4.0 // indirect
 	github.com/tklauser/numcpus v0.12.0 // indirect
 	github.com/twmb/franz-go/pkg/kmsg v1.14.0 // indirect
+	github.com/valyala/fastrand v1.1.0 // indirect
+	github.com/valyala/histogram v1.2.0 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.69.0 // indirect
