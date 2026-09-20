@@ -357,7 +357,6 @@ func TestBackfillAllNeverCopiesWalcastsOwnTables(t *testing.T) {
 		c.BackfillTables, c.BackfillChunkRows, c.BackfillChunkBytes = []string{config.BackfillAll}, 100, 1<<20
 	})
 	h.exec(fmt.Sprintf("INSERT INTO %s VALUES (1, 'row', true)", h.table))
-
 	stop := h.startSession()
 	h.waitFor("the user table to be copied", func() bool { status, _ := h.backfillStatus(); return status == "done" })
 	stop()
@@ -411,4 +410,33 @@ VALUES ('public.%s', 'public.%s'::regclass::oid, 0, 'running', '["20"]', '["10"]
 	if got := h.exec(fmt.Sprintf("SELECT pending_keys IS NULL FROM %s.backfills WHERE table_name = 'public.%s'", h.cfg.StateSchema, h.table)); string(got[0][0]) != "t" {
 		t.Fatal("parked keys were not cleared after they were read")
 	}
+}
+
+// One wide row cuts its chunk short at the byte budget. The row limit has to recover afterwards,
+// or every later chunk of the table would stay at that size.
+func TestBackfillChunkSizeRecoversAfterAWideRow(t *testing.T) {
+	const rows = 400
+	h := newHarness(t, backfillOf(50, 64<<10))
+	h.addToastColumn()
+	h.exec(fmt.Sprintf("INSERT INTO %s VALUES (1, 'wide', true, repeat(md5('wide'), 8000))", h.table))
+	h.exec(fmt.Sprintf("INSERT INTO %s SELECT g, 'narrow', true, NULL FROM generate_series(2, %d) g", h.table, rows))
+
+	stop := h.startSession()
+	h.waitFor("backfill to be marked done", func() bool { status, _ := h.backfillStatus(); return status == "done" })
+	stop()
+
+	chunks := map[any]int{}
+	events, _ := h.sink.snapshot()
+	for _, ev := range events {
+		if ev["op"] == "read" {
+			chunks[ev["backfill"]]++
+		}
+	}
+	if got := h.reads(); got != rows {
+		t.Fatalf("reads = %d, want %d", got, rows)
+	}
+	if len(chunks) > 30 {
+		t.Fatalf("%d rows took %d chunks: the chunk size never recovered from the wide row", rows, len(chunks))
+	}
+	t.Logf("%d rows in %d chunks", rows, len(chunks))
 }
