@@ -138,7 +138,7 @@ type session struct {
 func newSession(cfg config.Config, log zerolog.Logger, st stream) *session {
 	now := time.Now()
 	enc := event.NewEncoder()
-	enc.IgnoreSchema(cfg.StateSchema)
+	enc.IgnoreTable(cfg.StateSchema, stateTable)
 	return &session{
 		cfg:           cfg,
 		log:           log,
