@@ -46,6 +46,9 @@ type Config struct {
 	PublicationName   string   `env:"PUBLICATION_NAME" envDefault:"walcast_pub"`
 	PublicationTables []string `env:"PUBLICATION_TABLES"`
 
+	StateSchema            string `env:"STATE_SCHEMA" envDefault:"walcast_state"`
+	SlotRecreateGeneration int    `env:"SLOT_RECREATE_GENERATION" envDefault:"0"`
+
 	FeedbackInterval time.Duration `env:"FEEDBACK_INTERVAL" envDefault:"5s"`
 	ServerTimeout    time.Duration `env:"SERVER_TIMEOUT" envDefault:"60s"`
 	BatchMaxBytes    int           `env:"BATCH_MAX_BYTES" envDefault:"65536"`
@@ -107,6 +110,12 @@ func (c Config) Validate() error {
 		if !tableRE.MatchString(t) {
 			return fmt.Errorf("invalid table %q in PUBLICATION_TABLES", t)
 		}
+	}
+	if !nameRE.MatchString(c.StateSchema) {
+		return fmt.Errorf("invalid STATE_SCHEMA %q", c.StateSchema)
+	}
+	if c.SlotRecreateGeneration < 0 {
+		return errors.New("SLOT_RECREATE_GENERATION must not be negative")
 	}
 	if c.ShutdownTimeout <= 0 || c.SettleTimeout <= 0 {
 		return errors.New("SHUTDOWN_TIMEOUT and SINK_SETTLE_TIMEOUT must be positive")

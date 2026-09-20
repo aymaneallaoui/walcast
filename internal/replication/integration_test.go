@@ -116,6 +116,7 @@ func newHarness(t *testing.T, tune func(*config.Config)) *harness {
 		SlotName:          fmt.Sprintf("walcast_it_slot_%d", suffix),
 		PublicationName:   fmt.Sprintf("walcast_it_pub_%d", suffix),
 		PublicationTables: []string{"public." + h.table},
+		StateSchema:       "walcast_state",
 		FeedbackInterval:  200 * time.Millisecond,
 		ServerTimeout:     time.Minute,
 		BatchMaxBytes:     64 << 10,
