@@ -14,9 +14,17 @@ import (
 )
 
 const (
-	postgresImage  = "postgres:17-alpine"
-	startupTimeout = 2 * time.Minute
+	defaultPostgresImage = "postgres:17-alpine"
+	startupTimeout       = 2 * time.Minute
 )
+
+// postgresImage can be overridden to run the suite against another supported major version.
+func postgresImage() string {
+	if image := os.Getenv("WALCAST_TEST_POSTGRES_IMAGE"); image != "" {
+		return image
+	}
+	return defaultPostgresImage
+}
 
 // TestMain starts a throwaway Postgres unless DATABASE_URL already points at one. Without Docker
 // the tests skip locally and fail in CI, so a broken runner can never pass with zero tests run.
@@ -31,7 +39,7 @@ func run(m *testing.M) int {
 
 	ctx, cancel := context.WithTimeout(context.Background(), startupTimeout)
 	defer cancel()
-	container, err := postgres.Run(ctx, postgresImage,
+	container, err := postgres.Run(ctx, postgresImage(),
 		postgres.WithDatabase("walcast"),
 		postgres.WithUsername("walcast"),
 		postgres.WithPassword("walcast"),
