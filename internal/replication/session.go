@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/jackc/pglogrepl"
@@ -76,8 +77,8 @@ func (r *Runner) Run(ctx context.Context) (pglogrepl.LSN, error) {
 	return s.run(ctx, r.sink)
 }
 
-// awaitLastDispatcher keeps two sessions from calling the sink concurrently when the previous
-// dispatcher is still stuck inside a Send that outlived its drain deadline.
+// awaitLastDispatcher keeps two sessions from using the sink concurrently when the previous
+// one still has a Send or a done callback outstanding past its drain deadline.
 func (r *Runner) awaitLastDispatcher(ctx context.Context) error {
 	if r.lastDispatch == nil {
 		return nil
@@ -147,14 +148,23 @@ func (s *session) run(ctx context.Context, snk sink.Sink) (pglogrepl.LSN, error)
 	return s.ledger.Flushed(), err
 }
 
+// dispatch closes dispatched only once every done callback has fired, not merely when the
+// queue is empty: an asynchronous sink returns from Send long before delivery settles.
 func (s *session) dispatch(ctx context.Context, snk sink.Sink) {
-	defer close(s.dispatched)
+	var outstanding sync.WaitGroup
+	defer func() {
+		outstanding.Wait()
+		close(s.dispatched)
+	}()
+
 	for b := range s.queue {
 		if s.ledger.Err() != nil || ctx.Err() != nil {
 			b.Release()
 			continue
 		}
+		outstanding.Add(1)
 		snk.Send(ctx, b, func(err error) {
+			defer outstanding.Done()
 			if err != nil {
 				s.ledger.Fail(fmt.Errorf("sink: %w", err))
 			} else {
@@ -347,12 +357,10 @@ func (s *session) drain(flush bool) bool {
 	}
 	close(s.queue)
 
-	dispatched := s.dispatched
-	for dispatched != nil || (s.ledger.Depth() > 0 && s.ledger.Err() == nil) {
+	for {
 		select {
-		case <-dispatched:
-			dispatched = nil
-		case <-s.ledger.Notify():
+		case <-s.dispatched:
+			return true
 		case <-ticker.C:
 			if flush {
 				_ = s.sendStatus()
@@ -361,7 +369,6 @@ func (s *session) drain(flush bool) bool {
 			return false
 		}
 	}
-	return true
 }
 
 func (s *session) sendStatus() error {

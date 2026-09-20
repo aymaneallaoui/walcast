@@ -13,6 +13,7 @@ import (
 
 	"github.com/aymaneallaoui/walcast/internal/config"
 	"github.com/aymaneallaoui/walcast/internal/event"
+	"github.com/aymaneallaoui/walcast/internal/sink"
 )
 
 const testTimeout = 5 * time.Second
@@ -30,13 +31,14 @@ func testConfig() config.Config {
 
 type fakeStream struct {
 	msgs chan pgproto3.BackendMessage
+	errs chan error
 
 	mu       sync.Mutex
 	statuses []pglogrepl.LSN
 }
 
 func newFakeStream(msgs ...pgproto3.BackendMessage) *fakeStream {
-	f := &fakeStream{msgs: make(chan pgproto3.BackendMessage, 64)}
+	f := &fakeStream{msgs: make(chan pgproto3.BackendMessage, 64), errs: make(chan error, 1)}
 	for _, m := range msgs {
 		f.msgs <- m
 	}
@@ -47,6 +49,8 @@ func (f *fakeStream) Receive(ctx context.Context) (pgproto3.BackendMessage, erro
 	select {
 	case m := <-f.msgs:
 		return m, nil
+	case err := <-f.errs:
+		return nil, err
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -97,6 +101,34 @@ func (r *recordingSink) sent() (string, []pglogrepl.LSN) {
 	return string(r.payload), append([]pglogrepl.LSN(nil), r.acks...)
 }
 
+type asyncSink struct {
+	mu      sync.Mutex
+	pending []func(error)
+}
+
+func (a *asyncSink) Send(_ context.Context, _ *event.Batch, done func(error)) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.pending = append(a.pending, done)
+}
+
+func (a *asyncSink) Close() error { return nil }
+
+func (a *asyncSink) held() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.pending)
+}
+
+func (a *asyncSink) settle(err error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, done := range a.pending {
+		done(err)
+	}
+	a.pending = nil
+}
+
 func eventually(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(testTimeout)
@@ -108,7 +140,7 @@ func eventually(t *testing.T, what string, cond func() bool) {
 	}
 }
 
-func startSession(t *testing.T, cfg config.Config, st stream, snk *recordingSink) (cancel func(), result func() (pglogrepl.LSN, error)) {
+func startSession(t *testing.T, cfg config.Config, st stream, snk sink.Sink) (cancel func(), result func() (pglogrepl.LSN, error)) {
 	t.Helper()
 	ctx, stop := context.WithCancel(context.Background())
 	type outcome struct {
@@ -298,6 +330,43 @@ func TestSession_run(t *testing.T) {
 
 		if _, err := result(); !errors.Is(err, ErrServerSilent) {
 			t.Fatalf("err = %v, want ErrServerSilent", err)
+		}
+	})
+
+	t.Run("failed session still waits for asynchronous deliveries to settle", func(t *testing.T) {
+		snk := &asyncSink{}
+		st := newFakeStream(committedInsert()...)
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		sess := newSession(testConfig(), zerolog.Nop(), st)
+		finished := make(chan error, 1)
+		go func() {
+			_, err := sess.run(ctx, snk)
+			finished <- err
+		}()
+
+		eventually(t, "sink to hold the batch", func() bool { return snk.held() == 1 })
+		st.errs <- errors.New("connection reset")
+
+		select {
+		case err := <-finished:
+			t.Fatalf("session returned (%v) while a delivery was still outstanding", err)
+		case <-time.After(100 * time.Millisecond):
+		}
+		select {
+		case <-sess.dispatched:
+			t.Fatal("dispatched closed before the done callback fired")
+		default:
+		}
+
+		snk.settle(nil)
+		select {
+		case err := <-finished:
+			if err == nil {
+				t.Fatal("want the receive error")
+			}
+		case <-time.After(testTimeout):
+			t.Fatal("session never returned after the delivery settled")
 		}
 	})
 
