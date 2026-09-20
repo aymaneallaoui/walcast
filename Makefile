@@ -5,7 +5,7 @@ PKG := ./cmd/walcast
 export
 
 .DEFAULT_GOAL := build
-.PHONY: run build test test-integration bench fuzz vuln lint fmt up down
+.PHONY: run build test test-integration bench bench-e2e fuzz vuln lint fmt up down
 
 run:
 	go run $(PKG)
@@ -18,6 +18,9 @@ test:
 
 test-integration:
 	go test -tags integration -race -shuffle=on -count=1 ./internal/replication/
+
+bench-e2e:
+	go test -tags integration -run '^$$' -bench BenchmarkEndToEnd -benchtime=1x -count=3 -timeout 30m ./internal/replication
 
 bench:
 	go test -run '^$$' -bench . -benchmem -count=6 ./... | tee bench.txt
