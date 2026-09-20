@@ -55,13 +55,14 @@ func newSink(cfg config.Config, log zerolog.Logger) (sink.Sink, error) {
 		}, log), nil
 	case config.SinkKafka:
 		return sink.NewKafka(sink.KafkaConfig{
-			Brokers:       cfg.KafkaBrokers,
-			TopicPrefix:   cfg.KafkaTopicPrefix,
-			ClientID:      cfg.KafkaClientID,
-			TLS:           cfg.KafkaTLS,
-			SASLMechanism: cfg.KafkaSASLMechanism,
-			SASLUsername:  cfg.KafkaSASLUsername,
-			SASLPassword:  cfg.KafkaSASLPassword,
+			Brokers:         cfg.KafkaBrokers,
+			TopicPrefix:     cfg.KafkaTopicPrefix,
+			ClientID:        cfg.KafkaClientID,
+			TLS:             cfg.KafkaTLS,
+			SASLMechanism:   cfg.KafkaSASLMechanism,
+			SASLUsername:    cfg.KafkaSASLUsername,
+			SASLPassword:    cfg.KafkaSASLPassword,
+			MaxMessageBytes: cfg.KafkaMaxMessageBytes,
 		}, log)
 	default:
 		return sink.NewWriter(os.Stdout), nil

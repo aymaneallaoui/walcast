@@ -135,6 +135,7 @@ func kafkaConfig() Config {
 	cfg.KafkaBrokers = []string{"broker-1.example.com:9093", "broker-2.example.com:9093"}
 	cfg.KafkaTopicPrefix = "walcast."
 	cfg.KafkaTLS = true
+	cfg.KafkaMaxMessageBytes = 1000012
 	return cfg
 }
 
@@ -168,6 +169,8 @@ func TestValidate_kafkaSink(t *testing.T) {
 		"unknown sasl mechanism":      func(c *Config) { c.KafkaSASLMechanism = "gssapi" },
 		"sasl without credentials":    func(c *Config) { c.KafkaSASLMechanism = "plain" },
 		"topic prefix with bad chars": func(c *Config) { c.KafkaTopicPrefix = "wal cast/" },
+		"zero max message bytes":      func(c *Config) { c.KafkaMaxMessageBytes = 0 },
+		"absurd max message bytes":    func(c *Config) { c.KafkaMaxMessageBytes = 1 << 30 },
 	}
 	for name, mutate := range rejected {
 		t.Run("rejects "+name, func(t *testing.T) {
