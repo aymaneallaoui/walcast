@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pglogrepl"
 	"github.com/rs/zerolog"
 
+	"github.com/aymaneallaoui/walcast/internal/backoff"
 	"github.com/aymaneallaoui/walcast/internal/config"
 	"github.com/aymaneallaoui/walcast/internal/event"
 	"github.com/aymaneallaoui/walcast/internal/replication"
@@ -51,7 +52,7 @@ func (a *App) Run(ctx context.Context) error {
 			return errors.Join(err, a.sink.Close())
 		}
 
-		delay := backoff(attempt, a.cfg.ReconnectMinDelay, a.cfg.ReconnectMaxDelay)
+		delay := backoff.Delay(attempt, a.cfg.ReconnectMinDelay, a.cfg.ReconnectMaxDelay)
 		attempt++
 		a.log.Warn().Err(err).Dur("retry_in", delay).Stringer("confirmed_lsn", confirmed).Msg("replication session ended")
 
