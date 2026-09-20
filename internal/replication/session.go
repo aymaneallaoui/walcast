@@ -297,14 +297,18 @@ func (s *session) loop(ctx context.Context) error {
 				return fmt.Errorf("send status: %w", err)
 			}
 		}
+		// Neither branch reads the socket, so silence cannot be told from a server that talks: the
+		// clock only runs while listening. A dead connection still shows up as a failed status send.
 		if s.pending != nil {
 			s.enqueue(ctx)
+			s.lastServerMsg = time.Now()
 			continue
 		}
 		if s.reads != nil {
 			if err := s.emitReads(); err != nil {
 				return err
 			}
+			s.lastServerMsg = time.Now()
 			continue
 		}
 		s.reportChunk()

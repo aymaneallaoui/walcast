@@ -449,3 +449,54 @@ func TestRunner_awaitLastDispatcher(t *testing.T) {
 		}
 	})
 }
+
+// While a batch is pending the loop does not read the socket, so nothing the server sends can be
+// seen. Counting that time as server silence would end a healthy session whenever a sink stalls
+// for longer than SERVER_TIMEOUT.
+func TestSession_stalledSinkIsNotServerSilence(t *testing.T) {
+	cfg := testConfig()
+	cfg.ServerTimeout, cfg.FeedbackInterval = 150*time.Millisecond, 10*time.Millisecond
+	cfg.BatchMaxBytes, cfg.InflightMaxBytes = 1, 1
+	st := newFakeStream(
+		xlogData(10, relationMsg()),
+		xlogData(20, beginMsg(90, 7)), xlogData(30, insertMsg("1", "a")), xlogData(40, commitMsg(90, 100)),
+		xlogData(50, beginMsg(190, 8)), xlogData(60, insertMsg("2", "b")), xlogData(70, commitMsg(190, 200)),
+	)
+	snk := &asyncSink{}
+
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	finished := make(chan error, 1)
+	go func() {
+		_, err := newSession(cfg, zerolog.Nop(), st).run(ctx, snk)
+		finished <- err
+	}()
+	eventually(t, "the first batch to reach the sink", func() bool { return snk.held() == 1 })
+
+	select {
+	case err := <-finished:
+		t.Fatalf("session ended during a sink stall: %v", err)
+	case <-time.After(4 * cfg.ServerTimeout):
+	}
+
+	// A loop that gave up is still draining here, so its error only surfaces once the sink settles.
+	snk.settle(nil)
+	eventually(t, "the second batch to reach the sink", func() bool {
+		select {
+		case err := <-finished:
+			t.Fatalf("session ended because of the sink stall: %v", err)
+		default:
+		}
+		return snk.held() == 1
+	})
+	snk.settle(nil)
+	stop()
+	select {
+	case err := <-finished:
+		if err != nil {
+			t.Fatalf("run returned %v after the stall", err)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("session did not finish")
+	}
+}
