@@ -49,6 +49,9 @@ type Config struct {
 	StateSchema            string `env:"STATE_SCHEMA" envDefault:"walcast_state"`
 	SlotRecreateGeneration int    `env:"SLOT_RECREATE_GENERATION" envDefault:"0"`
 
+	MetricsAddr  string `env:"METRICS_ADDR"`
+	PprofEnabled bool   `env:"PPROF_ENABLED"`
+
 	BackfillTables     []string `env:"BACKFILL_TABLES"`
 	BackfillChunkRows  int      `env:"BACKFILL_CHUNK_ROWS" envDefault:"10000"`
 	BackfillChunkBytes int      `env:"BACKFILL_CHUNK_BYTES" envDefault:"4194304"`
@@ -154,6 +157,13 @@ func (c Config) Validate() error {
 	}
 	if err := c.validateBackfill(); err != nil {
 		return err
+	}
+	if c.MetricsAddr != "" {
+		if _, _, err := net.SplitHostPort(c.MetricsAddr); err != nil {
+			return fmt.Errorf("invalid METRICS_ADDR %q: %w", c.MetricsAddr, err)
+		}
+	} else if c.PprofEnabled {
+		return errors.New("PPROF_ENABLED needs METRICS_ADDR: pprof is served on the metrics listener")
 	}
 	if c.ShutdownTimeout <= 0 || c.SettleTimeout <= 0 {
 		return errors.New("SHUTDOWN_TIMEOUT and SINK_SETTLE_TIMEOUT must be positive")
