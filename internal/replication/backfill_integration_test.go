@@ -357,6 +357,12 @@ func TestBackfillAllNeverCopiesWalcastsOwnTables(t *testing.T) {
 		c.BackfillTables, c.BackfillChunkRows, c.BackfillChunkBytes = []string{config.BackfillAll}, 100, 1<<20
 	})
 	h.exec(fmt.Sprintf("INSERT INTO %s VALUES (1, 'row', true)", h.table))
+	others := h.exec(fmt.Sprintf(`SELECT count(*) FROM pg_tables WHERE schemaname NOT IN ('pg_catalog', 'information_schema', '%s') AND tablename <> '%s'`,
+		h.cfg.StateSchema, h.table))
+	if string(others[0][0]) != "0" {
+		t.Skip("the database holds other tables, and an all-tables backfill would copy them too")
+	}
+
 	stop := h.startSession()
 	h.waitFor("the user table to be copied", func() bool { status, _ := h.backfillStatus(); return status == "done" })
 	stop()
