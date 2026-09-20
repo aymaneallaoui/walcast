@@ -21,6 +21,7 @@ const testTimeout = 5 * time.Second
 func testConfig() config.Config {
 	return config.Config{
 		ShutdownTimeout:  2 * time.Second,
+		SettleTimeout:    time.Minute,
 		FeedbackInterval: 10 * time.Millisecond,
 		ServerTimeout:    time.Minute,
 		BatchMaxBytes:    64 << 10,
@@ -424,4 +425,27 @@ func BenchmarkSession_handleXLogData(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+func TestRunner_awaitLastDispatcher(t *testing.T) {
+	cfg := testConfig()
+	cfg.SettleTimeout = 30 * time.Millisecond
+
+	t.Run("gives up with a fatal error when deliveries never settle", func(t *testing.T) {
+		r := NewRunner(cfg, &recordingSink{}, zerolog.Nop())
+		r.lastDispatch = make(chan struct{})
+		if err := r.awaitLastDispatcher(context.Background()); !errors.Is(err, ErrSinkStuck) {
+			t.Fatalf("err = %v, want ErrSinkStuck", err)
+		}
+	})
+
+	t.Run("proceeds once the previous dispatcher finished", func(t *testing.T) {
+		r := NewRunner(cfg, &recordingSink{}, zerolog.Nop())
+		finished := make(chan struct{})
+		close(finished)
+		r.lastDispatch = finished
+		if err := r.awaitLastDispatcher(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	})
 }

@@ -24,7 +24,12 @@ const (
 	closeTimeout       = 5 * time.Second
 )
 
-var ErrServerSilent = errors.New("replication: server went silent")
+var (
+	ErrServerSilent = errors.New("replication: server went silent")
+
+	// ErrSinkStuck is fatal: only a restart drops a sink client whose deliveries never settle.
+	ErrSinkStuck = errors.New("replication: previous session's deliveries never settled")
+)
 
 // Runner runs replication sessions one at a time against a single sink.
 type Runner struct {
@@ -87,11 +92,16 @@ func (r *Runner) awaitLastDispatcher(ctx context.Context) error {
 	case <-r.lastDispatch:
 		return nil
 	default:
-		r.log.Warn().Msg("previous session still has deliveries in flight, reconnecting once they settle")
+		r.log.Warn().Dur("timeout", r.cfg.SettleTimeout).Msg("previous session still has deliveries in flight, reconnecting once they settle")
 	}
+
+	timer := time.NewTimer(r.cfg.SettleTimeout)
+	defer timer.Stop()
 	select {
 	case <-r.lastDispatch:
 		return nil
+	case <-timer.C:
+		return fmt.Errorf("%w within %s", ErrSinkStuck, r.cfg.SettleTimeout)
 	case <-ctx.Done():
 		return ctx.Err()
 	}
