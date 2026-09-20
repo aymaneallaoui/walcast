@@ -2,6 +2,7 @@ package replication
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -22,6 +23,10 @@ const (
 	queueCap           = 256
 	maxInflightBatches = 1024
 	closeTimeout       = 5 * time.Second
+
+	// While a chunk waits for its delivery to be noticed, the owner loop must not sit in Receive
+	// until the next feedback deadline, or every chunk on a quiet stream would take that long.
+	chunkPollInterval = 5 * time.Millisecond
 )
 
 var (
@@ -71,12 +76,27 @@ func (r *Runner) Run(ctx context.Context) (pglogrepl.LSN, error) {
 	if err := r.ensureSlot(ctx, conn); err != nil {
 		return 0, err
 	}
-	if err := startReplication(ctx, conn, r.cfg.SlotName, r.cfg.PublicationName); err != nil {
+	backfilling := len(r.cfg.BackfillTables) > 0
+	systemID := ""
+	if backfilling {
+		sys, err := pglogrepl.IdentifySystem(ctx, conn)
+		if err != nil {
+			return 0, fmt.Errorf("identify system: %w", err)
+		}
+		systemID = sys.SystemID
+	}
+	if err := startReplication(ctx, conn, r.cfg.SlotName, r.cfg.PublicationName, backfilling); err != nil {
 		return 0, err
 	}
 	r.log.Info().Str("slot", r.cfg.SlotName).Msg("replication started")
 
 	s := newSession(r.cfg, r.log, pgStream{conn})
+	if backfilling {
+		if s.link, err = newBackfillLink(); err != nil {
+			return 0, err
+		}
+		s.systemID, s.backfilling = systemID, true
+	}
 	r.lastDispatch = s.dispatched
 	return s.run(ctx, r.sink)
 }
@@ -127,12 +147,50 @@ type session struct {
 	queue      chan *event.Batch
 	dispatched chan struct{}
 
-	cur           *event.Batch
-	pending       *event.Batch
-	inTx          bool
+	cur     *event.Batch
+	pending *event.Batch
+	inTx    bool
+	xid     uint32
+
+	link      *backfillLink
+	systemID  string
+	tracker   *tracker
+	reads     *chunkReads
+	awaited   *awaitedChunk
+	commitLSN pglogrepl.LSN
+	keyMoves  []keyMove
+	// backfilling is true from the start of a session with a backfill configured until the worker's
+	// stop marker: a key move replayed after a crash is decoded before any tracker exists.
+	backfilling bool
+
 	lingerAt      time.Time
 	nextFeedback  time.Time
 	lastServerMsg time.Time
+}
+
+// chunkReads is a chunk being written into the stream at its marker's position. It spans several
+// loop iterations because only one sealed batch can be pending at a time.
+type chunkReads struct {
+	chunk   *chunk
+	lsn     pglogrepl.LSN
+	next    int
+	emitted int
+	retry   [][]string
+	key     []byte
+}
+
+// keyMove is the insert half of a key-changing update that left out an unchanged TOAST column. The
+// consumer can only complete it from the old row, which it may never have been sent, and the scan
+// may already be past the new key. So the row is read again, and until then the ack stays before
+// its transaction: a crash then replays the move instead of forgetting it.
+type keyMove struct {
+	table string
+	key   []byte
+}
+
+type awaitedChunk struct {
+	result chunkResult
+	lsn    pglogrepl.LSN
 }
 
 func newSession(cfg config.Config, log zerolog.Logger, st stream) *session {
@@ -160,7 +218,19 @@ func (s *session) run(ctx context.Context, snk sink.Sink) (pglogrepl.LSN, error)
 	defer stopLoop()
 	go s.dispatch(sinkCtx, snk, stopLoop)
 
+	var backfill sync.WaitGroup
+	if s.link != nil {
+		backfill.Go(func() {
+			if err := runBackfill(loopCtx, s.cfg, s.log, s.link, s.systemID); err != nil {
+				s.ledger.Fail(err)
+				stopLoop()
+			}
+		})
+	}
+
 	err := s.loop(loopCtx)
+	stopLoop()
+	backfill.Wait()
 	if err != nil {
 		s.ledger.Fail(err)
 	}
@@ -228,8 +298,18 @@ func (s *session) loop(ctx context.Context) error {
 			s.enqueue(ctx)
 			continue
 		}
+		if s.reads != nil {
+			if err := s.emitReads(); err != nil {
+				return err
+			}
+			continue
+		}
+		s.reportChunk()
 
 		deadline := s.nextFeedback
+		if s.awaited != nil {
+			deadline = time.Now().Add(chunkPollInterval)
+		}
 		if s.sealable() && s.lingerAt.Before(deadline) {
 			deadline = s.lingerAt
 		}
@@ -325,12 +405,16 @@ func (s *session) handleXLogData(data []byte) error {
 	}
 
 	wasDirty := s.cur.Dirty()
+	recorded := len(s.cur.Records)
 	switch m := msg.(type) {
 	case *pglogrepl.RelationMessage:
 		s.enc.Relation(m)
 	case *pglogrepl.BeginMessage:
 		s.enc.Begin(m)
 		s.inTx = true
+		s.xid, s.commitLSN = m.Xid, m.FinalLSN
+	case *pglogrepl.LogicalDecodingMessage:
+		s.handleMarker(m)
 	case *pglogrepl.InsertMessage:
 		err = s.enc.Insert(s.cur, xld.WALStart, m)
 	case *pglogrepl.UpdateMessage:
@@ -348,6 +432,9 @@ func (s *session) handleXLogData(data []byte) error {
 	if err != nil {
 		return fmt.Errorf("encode event at %s: %w", xld.WALStart, err)
 	}
+	if s.backfilling {
+		s.observe(s.cur.Records[recorded:])
+	}
 
 	if !wasDirty && s.cur.Dirty() {
 		s.lingerAt = time.Now().Add(s.cfg.BatchLinger)
@@ -356,6 +443,135 @@ func (s *session) handleXLogData(data []byte) error {
 		s.seal()
 	}
 	return nil
+}
+
+// handleMarker reacts to the backfill worker's logical messages. They arrive at an exact stream
+// position, never inside a transaction, and a marker from another session is ignored.
+func (s *session) handleMarker(m *pglogrepl.LogicalDecodingMessage) {
+	if s.link == nil || m.Prefix != markerPrefix || m.Transactional {
+		return
+	}
+	var mk marker
+	if err := json.Unmarshal(m.Content, &mk); err != nil || mk.Session != s.link.session {
+		return
+	}
+
+	switch mk.Kind {
+	case markerTrack:
+		s.tracker = newTracker(mk.Table, mk.Generation, mk.Ref)
+		select {
+		case <-s.link.tracked:
+		default:
+		}
+		s.link.tracked <- mk.Generation
+	case markerStop:
+		s.tracker, s.backfilling, s.keyMoves = nil, false, nil
+		s.ledger.Release()
+	case markerChunk:
+		c := s.link.take(mk.Generation, mk.Chunk)
+		if c == nil {
+			return
+		}
+		if s.tracker == nil || s.tracker.generation != mk.Generation || s.tracker.overflowed {
+			s.awaited = &awaitedChunk{result: chunkResult{generation: mk.Generation, number: mk.Chunk, invalid: true}}
+			return
+		}
+		s.reads = &chunkReads{chunk: c, lsn: m.LSN}
+	}
+}
+
+// emitReads writes chunk rows into the current batch until it is full. The batch that holds the
+// last row is acked at the marker's LSN, exactly as a commit acks its transaction.
+func (s *session) emitReads() error {
+	r, wasDirty := s.reads, s.cur.Dirty()
+	for r.next < len(r.chunk.rows) && len(s.cur.Buf) < s.cfg.BatchMaxBytes {
+		row := r.chunk.rows[r.next]
+		key, err := r.chunk.table.AppendKey(r.key[:0], row)
+		if err != nil {
+			return fmt.Errorf("backfill row key: %w", err)
+		}
+		r.key = key
+		switch s.tracker.verdict(key, r.chunk.xmin) {
+		case rowRetry:
+			r.retry = append(r.retry, r.chunk.keys[r.next])
+		case rowEmit:
+			if err := s.enc.Read(s.cur, r.lsn, r.chunk.table, row, r.chunk.backfillID, uint64(r.next), r.chunk.ts); err != nil {
+				return fmt.Errorf("encode backfill row: %w", err)
+			}
+			r.emitted++
+		}
+		r.next++
+	}
+	if !wasDirty && s.cur.Dirty() {
+		s.lingerAt = time.Now().Add(s.cfg.BatchLinger)
+	}
+
+	if r.next < len(r.chunk.rows) {
+		s.seal()
+		return nil
+	}
+	if s.cur.Dirty() || !s.ledger.AdvanceIdle(r.lsn) {
+		s.cur.AckLSN = r.lsn
+	}
+	s.tracker.prune(r.chunk.xmin)
+	s.awaited = &awaitedChunk{lsn: r.lsn, result: chunkResult{
+		generation: r.chunk.generation, number: r.chunk.number, emitted: r.emitted, retry: r.retry,
+		orphans: s.takeKeyMoves(r.chunk.tableName),
+	}}
+	s.reads = nil
+	return nil
+}
+
+// reportChunk tells the worker once everything up to the chunk's marker is delivered. Progress is
+// saved only after this, so a crash repeats a chunk and never skips one.
+func (s *session) reportChunk() {
+	a := s.awaited
+	if a == nil {
+		return
+	}
+	if !a.result.invalid {
+		if !s.inTx && !s.cur.Dirty() {
+			s.ledger.AdvanceIdle(a.lsn)
+		}
+		if s.ledger.Delivered() < a.lsn {
+			return
+		}
+	}
+	select {
+	case s.link.results <- a.result:
+		s.awaited = nil
+		// A chunk that came back clean, with no key move seen since, leaves nothing to replay for.
+		if !a.result.invalid && len(a.result.retry) == 0 && len(a.result.orphans) == 0 && len(s.keyMoves) == 0 {
+			s.ledger.Release()
+		}
+	default:
+	}
+}
+
+func (s *session) observe(records []event.Record) {
+	for _, rec := range records {
+		key := s.cur.Key(rec)
+		if s.tracker != nil {
+			s.tracker.observe(rec, key, s.xid)
+		}
+		if rec.Op == event.OpInsert && rec.Partial {
+			s.keyMoves = append(s.keyMoves, keyMove{table: rec.Table, key: append([]byte{}, key...)})
+			s.ledger.Hold(s.commitLSN)
+		}
+	}
+}
+
+// takeKeyMoves hands over the moves of the table being backfilled and forgets the rest: a table
+// that is done has its baselines, and one that has not started will meet the row in its scan.
+func (s *session) takeKeyMoves(table string) [][]byte {
+	var keys [][]byte
+	for _, move := range s.keyMoves {
+		if move.table == table {
+			keys = append(keys, move.key)
+		}
+	}
+	s.keyMoves = nil
+	return keys
 }
 
 func (s *session) sealable() bool {
