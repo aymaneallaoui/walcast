@@ -22,6 +22,8 @@ import (
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/rs/zerolog"
+	"github.com/twmb/franz-go/pkg/kfake"
+	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/aymaneallaoui/walcast/internal/app"
 	"github.com/aymaneallaoui/walcast/internal/config"
@@ -502,5 +504,78 @@ func TestWebhookSinkSurvivesReceiverOutageWithoutLossOrEarlyAck(t *testing.T) {
 	}
 	if len(lines) != 2 || !strings.Contains(lines[0], "during outage") || !strings.Contains(lines[1], "after recovery") {
 		t.Fatalf("receiver got %q, want the two rows in commit order", lines)
+	}
+}
+
+func TestKafkaSinkDeliversRowChangesKeyedByPrimaryKey(t *testing.T) {
+	h := newHarness(t, nil)
+	topic := "walcast.public." + h.table
+	cluster, err := kfake.NewCluster(kfake.SeedTopics(3, topic))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cluster.Close)
+	snk, err := sink.NewKafka(sink.KafkaConfig{Brokers: cluster.ListenAddrs(), TopicPrefix: "walcast.", ClientID: "walcast-it"}, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = snk.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	finished := make(chan error, 1)
+	go func() {
+		_, err := replication.NewRunner(h.cfg, snk, zerolog.Nop()).Run(ctx)
+		finished <- err
+	}()
+	t.Cleanup(cancel)
+	h.waitFor("slot to become active", h.slotActive)
+
+	h.exec(fmt.Sprintf("INSERT INTO %s VALUES (1, 'a', true), (2, 'b', true)", h.table))
+	h.exec(fmt.Sprintf("UPDATE %s SET name = 'a2' WHERE id = 1", h.table))
+	h.exec(fmt.Sprintf("DELETE FROM %s WHERE id = 1", h.table))
+
+	consumer, err := kgo.NewClient(kgo.SeedBrokers(cluster.ListenAddrs()...), kgo.ConsumeTopics(topic), kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer consumer.Close()
+	pollCtx, stopPolling := context.WithTimeout(context.Background(), waitTimeout)
+	defer stopPolling()
+
+	opsByKey := map[string][]string{}
+	var lastCommit pglogrepl.LSN
+	for got := 0; got < 4; {
+		fetches := consumer.PollFetches(pollCtx)
+		if err := fetches.Err0(); err != nil {
+			t.Fatalf("consumed %d of 4 records: %v", got, err)
+		}
+		for _, r := range fetches.Records() {
+			var ev map[string]any
+			if err := json.Unmarshal(r.Value, &ev); err != nil {
+				t.Fatalf("record value is not one JSON event: %q", r.Value)
+			}
+			opsByKey[string(r.Key)] = append(opsByKey[string(r.Key)], ev["op"].(string))
+			if lsn, err := pglogrepl.ParseLSN(ev["commit_lsn"].(string)); err == nil && lsn > lastCommit {
+				lastCommit = lsn
+			}
+			got++
+		}
+	}
+	if got := fmt.Sprint(opsByKey[`{"id":1}`]); got != "[insert update delete]" {
+		t.Errorf("row 1 saw %s, want [insert update delete] in order", got)
+	}
+	if got := fmt.Sprint(opsByKey[`{"id":2}`]); got != "[insert]" {
+		t.Errorf("row 2 saw %s, want [insert]", got)
+	}
+	h.waitFor("ack after the broker confirmed the records", func() bool { return h.confirmedLSN() >= lastCommit })
+
+	cancel()
+	select {
+	case err := <-finished:
+		if err != nil {
+			t.Fatalf("Run returned error on shutdown: %v", err)
+		}
+	case <-time.After(waitTimeout):
+		t.Fatal("Run did not stop after cancel")
 	}
 }
