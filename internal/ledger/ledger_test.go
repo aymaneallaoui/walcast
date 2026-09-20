@@ -132,3 +132,33 @@ func TestDepthCountsCompletedBatchesBehindUnfinishedHead(t *testing.T) {
 		t.Fatalf("depth = %d after head completed, want 0", got)
 	}
 }
+
+func TestHoldCapsWhatIsReportedButNotWhatIsDelivered(t *testing.T) {
+	l := New(0)
+	first, second := l.Add(100, 10), l.Add(200, 10)
+	l.Done(first)
+
+	l.Hold(150)
+	l.Hold(180)
+	l.Done(second)
+	if got := l.Flushed(); got != 150 {
+		t.Fatalf("Flushed = %s, want the earliest hold 0/96", got)
+	}
+	if got := l.Delivered(); got != 200 {
+		t.Fatalf("Delivered = %s, want 0/C8: a hold must not hide a delivery", got)
+	}
+
+	l.Release()
+	if got := l.Flushed(); got != 200 {
+		t.Fatalf("Flushed after release = %s, want 0/C8", got)
+	}
+}
+
+func TestHoldAboveTheFlushedPositionChangesNothing(t *testing.T) {
+	l := New(0)
+	l.Done(l.Add(100, 10))
+	l.Hold(500)
+	if got := l.Flushed(); got != 100 {
+		t.Fatalf("Flushed = %s, want 0/64", got)
+	}
+}
