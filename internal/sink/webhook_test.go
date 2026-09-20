@@ -1,6 +1,7 @@
 package sink
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"errors"
@@ -259,5 +260,54 @@ func TestWebhook_SendWaitsOutRetryAfterBeyondItsOwnBackoffCap(t *testing.T) {
 	}
 	if n := len(rcv.seen()); n != 2 {
 		t.Fatalf("got %d requests, want 2", n)
+	}
+}
+
+func TestWebhook_postErrorsDoNotLeakTheURL(t *testing.T) {
+	wh := NewWebhook(WebhookConfig{
+		URL: "http://127.0.0.1:1/hooks/path-token-abc?token=query-token-xyz", Secret: testSecret,
+		Timeout: time.Second, RetryMin: time.Millisecond, RetryMax: time.Millisecond,
+	}, zerolog.Nop())
+	t.Cleanup(func() { _ = wh.Close() })
+
+	_, err := wh.post(context.Background(), &event.Batch{Buf: []byte("{}\n"), Events: 1}, "key", 0)
+	if err == nil {
+		t.Fatal("expected a connection error")
+	}
+	for _, secret := range []string{"path-token-abc", "query-token-xyz"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("error leaks %q: %v", secret, err)
+		}
+	}
+}
+
+func BenchmarkSign(b *testing.B) {
+	body := bytes.Repeat([]byte(`{"table":"public.users","op":"insert","new":{"id":7}}`+"\n"), 1200)
+	now := time.Now()
+	b.SetBytes(int64(len(body)))
+	b.ReportAllocs()
+	for b.Loop() {
+		Sign([]byte(testSecret), now, body)
+	}
+}
+
+func BenchmarkWebhook_Send(b *testing.B) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	wh := NewWebhook(WebhookConfig{URL: srv.URL, Secret: testSecret, Timeout: 5 * time.Second, RetryMin: time.Millisecond, RetryMax: time.Millisecond}, zerolog.Nop())
+	defer func() { _ = wh.Close() }()
+	batch := &event.Batch{Buf: bytes.Repeat([]byte(`{"table":"public.users","op":"insert","new":{"id":7}}`+"\n"), 1200), Events: 1200}
+
+	b.SetBytes(int64(len(batch.Buf)))
+	b.ReportAllocs()
+	for b.Loop() {
+		wh.Send(context.Background(), batch, func(err error) {
+			if err != nil {
+				b.Fatal(err)
+			}
+		})
 	}
 }
