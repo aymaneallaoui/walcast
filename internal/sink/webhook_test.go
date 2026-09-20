@@ -216,21 +216,48 @@ func TestWebhook_Send(t *testing.T) {
 }
 
 func TestParseRetryAfter(t *testing.T) {
+	now := time.Date(2026, 10, 21, 7, 28, 0, 0, time.UTC)
 	tests := []struct {
 		name string
 		in   string
 		want time.Duration
 	}{
 		{"seconds", "7", 7 * time.Second},
+		{"seconds above our own backoff cap are kept", "120", 2 * time.Minute},
+		{"http date", "Wed, 21 Oct 2026 07:30:00 GMT", 2 * time.Minute},
+		{"http date in the past", "Wed, 21 Oct 2026 07:00:00 GMT", 0},
+		{"absurd value hits the ceiling", "864000", maxRetryAfter},
 		{"empty", "", 0},
-		{"http date is ignored", "Wed, 21 Oct 2026 07:28:00 GMT", 0},
+		{"garbage", "soon", 0},
 		{"negative", "-3", 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := parseRetryAfter(tt.in); got != tt.want {
+			if got := parseRetryAfter(tt.in, now); got != tt.want {
 				t.Fatalf("got %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestWebhook_SendWaitsOutRetryAfterBeyondItsOwnBackoffCap(t *testing.T) {
+	wh, rcv := newWebhook(t, func(n int, w http.ResponseWriter) {
+		if n == 1 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	started := time.Now()
+	if err := send(t, context.Background(), wh, "{}\n"); err != nil {
+		t.Fatal(err)
+	}
+	if waited := time.Since(started); waited < time.Second {
+		t.Fatalf("retried after %v, the receiver asked for 1s and RetryMax is 5ms", waited)
+	}
+	if n := len(rcv.seen()); n != 2 {
+		t.Fatalf("got %d requests, want 2", n)
 	}
 }
