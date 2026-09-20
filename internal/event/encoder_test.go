@@ -203,6 +203,55 @@ func TestUpdateRebuildsToastedKeyFromOldTuple(t *testing.T) {
 	}
 }
 
+func TestUpdateOfTheKeySplitsIntoDeleteAndInsert(t *testing.T) {
+	e := newTestEncoder()
+	b := &Batch{}
+	err := e.Update(b, 5, &pglogrepl.UpdateMessage{
+		RelationID:   usersRelID,
+		OldTupleType: pglogrepl.UpdateMessageTupleTypeKey,
+		OldTuple:     tuple(text("1"), null(), null(), null(), null(), null()),
+		NewTuple:     tuple(text("2"), text("a"), text("t"), text("1"), null(), null()),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b.Records) != 2 || b.Events != 2 {
+		t.Fatalf("got %d records, want a delete and an insert", len(b.Records))
+	}
+
+	want := []struct{ op, key, row string }{{OpDelete, `{"id":1}`, "old"}, {OpInsert, `{"id":2}`, "new"}}
+	for i, r := range b.Records {
+		var ev map[string]any
+		if err := json.Unmarshal(b.Value(r), &ev); err != nil {
+			t.Fatal(err)
+		}
+		if r.Op != want[i].op || ev["op"] != want[i].op || ev["origin"] != OpUpdate || string(b.Key(r)) != want[i].key || ev["seq"] != float64(i) {
+			t.Errorf("event %d: record op=%s key=%s event=%v", i, r.Op, b.Key(r), ev)
+		}
+		if _, ok := ev[want[i].row]; !ok {
+			t.Errorf("event %d has no %q row: %v", i, want[i].row, ev)
+		}
+	}
+}
+
+func TestUpdateWithUnchangedKeyStaysOneEvent(t *testing.T) {
+	e := newTestEncoder()
+	b := &Batch{}
+	err := e.Update(b, 5, &pglogrepl.UpdateMessage{
+		RelationID:   usersRelID,
+		OldTupleType: pglogrepl.UpdateMessageTupleTypeKey,
+		OldTuple:     tuple(text("1"), null(), null(), null(), null(), null()),
+		NewTuple:     tuple(text("1"), text("renamed"), text("t"), text("1"), null(), null()),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev := decode(t, b)
+	if len(b.Records) != 1 || ev["op"] != OpUpdate || ev["origin"] != nil {
+		t.Fatalf("got %d records, event %v", len(b.Records), ev)
+	}
+}
+
 func TestKeyIsNeverInvented(t *testing.T) {
 	e := newTestEncoder()
 	err := e.Update(&Batch{}, 1, &pglogrepl.UpdateMessage{

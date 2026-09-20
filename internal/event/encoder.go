@@ -1,6 +1,7 @@
 package event
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"strconv"
@@ -10,10 +11,10 @@ import (
 )
 
 const (
-	opInsert   = "insert"
-	opUpdate   = "update"
-	opDelete   = "delete"
-	opTruncate = "truncate"
+	OpInsert   = "insert"
+	OpUpdate   = "update"
+	OpDelete   = "delete"
+	OpTruncate = "truncate"
 
 	columnFlagKey       = 1
 	replicaIdentityFull = 'f'
@@ -46,6 +47,7 @@ type Encoder struct {
 	ts        []byte
 	unchanged [][]byte
 	recStart  int
+	op        string
 }
 
 func NewEncoder() *Encoder {
@@ -87,7 +89,7 @@ func (e *Encoder) Insert(b *Batch, lsn pglogrepl.LSN, m *pglogrepl.InsertMessage
 	if err != nil {
 		return err
 	}
-	e.header(b, rel, opInsert, lsn)
+	e.header(b, rel, OpInsert, "", lsn)
 	if err := e.tuple(b, rel, ",\"new\":", m.Tuple, false); err != nil {
 		return err
 	}
@@ -99,7 +101,10 @@ func (e *Encoder) Update(b *Batch, lsn pglogrepl.LSN, m *pglogrepl.UpdateMessage
 	if err != nil {
 		return err
 	}
-	e.header(b, rel, opUpdate, lsn)
+	if rel.keyed && m.OldTupleType == pglogrepl.UpdateMessageTupleTypeKey && keyChanged(rel, m.OldTuple, m.NewTuple) {
+		return e.keyChange(b, rel, lsn, m)
+	}
+	e.header(b, rel, OpUpdate, "", lsn)
 	if m.OldTuple != nil {
 		keyOnly := m.OldTupleType == pglogrepl.UpdateMessageTupleTypeKey
 		if err := e.tuple(b, rel, ",\"old\":", m.OldTuple, keyOnly); err != nil {
@@ -112,12 +117,43 @@ func (e *Encoder) Update(b *Batch, lsn pglogrepl.LSN, m *pglogrepl.UpdateMessage
 	return e.footer(b, rel, m.NewTuple, m.OldTuple)
 }
 
+// keyChange turns an update of the row identity into a delete under the old key and an insert
+// under the new one, so each key's stream stays self-consistent for consumers partitioned by key.
+func (e *Encoder) keyChange(b *Batch, rel *relation, lsn pglogrepl.LSN, m *pglogrepl.UpdateMessage) error {
+	e.header(b, rel, OpDelete, OpUpdate, lsn)
+	if err := e.tuple(b, rel, ",\"old\":", m.OldTuple, true); err != nil {
+		return err
+	}
+	if err := e.footer(b, rel, m.OldTuple, nil); err != nil {
+		return err
+	}
+
+	e.header(b, rel, OpInsert, OpUpdate, lsn)
+	if err := e.tuple(b, rel, ",\"new\":", m.NewTuple, false); err != nil {
+		return err
+	}
+	return e.footer(b, rel, m.NewTuple, m.OldTuple)
+}
+
+func keyChanged(rel *relation, old, updated *pglogrepl.TupleData) bool {
+	if old == nil || updated == nil || len(old.Columns) != len(updated.Columns) || len(old.Columns) != len(rel.cols) {
+		return false
+	}
+	for i := range rel.cols {
+		was, is := old.Columns[i], updated.Columns[i]
+		if rel.cols[i].isKey && is.DataType == pglogrepl.TupleDataTypeText && !bytes.Equal(was.Data, is.Data) {
+			return true
+		}
+	}
+	return false
+}
+
 func (e *Encoder) Delete(b *Batch, lsn pglogrepl.LSN, m *pglogrepl.DeleteMessage) error {
 	rel, err := e.relation(m.RelationID)
 	if err != nil {
 		return err
 	}
-	e.header(b, rel, opDelete, lsn)
+	e.header(b, rel, OpDelete, "", lsn)
 	keyOnly := m.OldTupleType == pglogrepl.DeleteMessageTupleTypeKey
 	if err := e.tuple(b, rel, ",\"old\":", m.OldTuple, keyOnly); err != nil {
 		return err
@@ -131,7 +167,7 @@ func (e *Encoder) Truncate(b *Batch, lsn pglogrepl.LSN, m *pglogrepl.TruncateMes
 		if err != nil {
 			return err
 		}
-		e.header(b, rel, opTruncate, lsn)
+		e.header(b, rel, OpTruncate, "", lsn)
 		if err := e.footer(b, rel, nil, nil); err != nil {
 			return err
 		}
@@ -147,8 +183,9 @@ func (e *Encoder) relation(id uint32) (*relation, error) {
 	return rel, nil
 }
 
-func (e *Encoder) header(b *Batch, rel *relation, op string, lsn pglogrepl.LSN) {
+func (e *Encoder) header(b *Batch, rel *relation, op, origin string, lsn pglogrepl.LSN) {
 	e.recStart = len(b.Buf)
+	e.op = op
 	buf := b.Buf
 	buf = append(buf, "{\"table\":"...)
 	buf = append(buf, rel.table...)
@@ -165,6 +202,11 @@ func (e *Encoder) header(b *Batch, rel *relation, op string, lsn pglogrepl.LSN) 
 	buf = append(buf, ",\"ts\":\""...)
 	buf = append(buf, e.ts...)
 	buf = append(buf, '"')
+	if origin != "" {
+		buf = append(buf, ",\"origin\":\""...)
+		buf = append(buf, origin...)
+		buf = append(buf, '"')
+	}
 	b.Buf = buf
 	e.unchanged = e.unchanged[:0]
 }
@@ -189,6 +231,7 @@ func (e *Encoder) footer(b *Batch, rel *relation, identity, previous *pglogrepl.
 	}
 	b.Keys = keys
 	b.Records = append(b.Records, Record{
+		Op:     e.op,
 		Schema: rel.schema, Name: rel.relname,
 		Table:      rel.name,
 		valueStart: e.recStart, valueEnd: len(buf),
