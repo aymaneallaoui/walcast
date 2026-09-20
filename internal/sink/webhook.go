@@ -37,9 +37,6 @@ const (
 	maxRequestIDLen = 64
 )
 
-// ErrRejected means the receiver refused the batch for good: retrying the same bytes cannot help.
-var ErrRejected = errors.New("sink: webhook rejected the batch")
-
 type WebhookConfig struct {
 	URL        string
 	Secret     string

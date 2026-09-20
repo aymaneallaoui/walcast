@@ -8,6 +8,9 @@ import (
 	"github.com/aymaneallaoui/walcast/internal/event"
 )
 
+// ErrRejected means the destination refused the batch for good: retrying the same bytes cannot help.
+var ErrRejected = errors.New("sink: batch rejected")
+
 // ErrWriterBusy means an earlier write is still blocked, for instance on a pipe nobody reads.
 var ErrWriterBusy = errors.New("sink: previous write has not returned")
 
