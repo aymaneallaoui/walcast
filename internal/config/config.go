@@ -17,13 +17,20 @@ import (
 const (
 	SinkStdout  = "stdout"
 	SinkWebhook = "webhook"
+	SinkKafka   = "kafka"
+
+	saslPlain       = "plain"
+	saslScramSHA256 = "scram-sha-256"
+	saslScramSHA512 = "scram-sha-512"
+	maxTopicLen     = 249
 
 	minWebhookSecretLen = 16
 )
 
 var (
-	nameRE  = regexp.MustCompile(`^[a-z_][a-z0-9_]{0,62}$`)
-	tableRE = regexp.MustCompile(`^[a-z_][a-z0-9_]{0,62}(\.[a-z_][a-z0-9_]{0,62})?$`)
+	nameRE        = regexp.MustCompile(`^[a-z_][a-z0-9_]{0,62}$`)
+	topicPrefixRE = regexp.MustCompile(`^[a-zA-Z0-9._-]*$`)
+	tableRE       = regexp.MustCompile(`^[a-z_][a-z0-9_]{0,62}(\.[a-z_][a-z0-9_]{0,62})?$`)
 )
 
 type Config struct {
@@ -51,6 +58,14 @@ type Config struct {
 	WebhookTimeout  time.Duration `env:"WEBHOOK_TIMEOUT" envDefault:"10s"`
 	WebhookRetryMin time.Duration `env:"WEBHOOK_RETRY_MIN" envDefault:"500ms"`
 	WebhookRetryMax time.Duration `env:"WEBHOOK_RETRY_MAX" envDefault:"30s"`
+
+	KafkaBrokers       []string `env:"KAFKA_BROKERS"`
+	KafkaTopicPrefix   string   `env:"KAFKA_TOPIC_PREFIX" envDefault:"walcast."`
+	KafkaClientID      string   `env:"KAFKA_CLIENT_ID" envDefault:"walcast"`
+	KafkaTLS           bool     `env:"KAFKA_TLS"`
+	KafkaSASLMechanism string   `env:"KAFKA_SASL_MECHANISM"`
+	KafkaSASLUsername  string   `env:"KAFKA_SASL_USERNAME"`
+	KafkaSASLPassword  string   `env:"KAFKA_SASL_PASSWORD"`
 }
 
 func Load() (Config, error) {
@@ -64,6 +79,9 @@ func Load() (Config, error) {
 	}
 	for i, t := range cfg.PublicationTables {
 		cfg.PublicationTables[i] = strings.TrimSpace(t)
+	}
+	for i, b := range cfg.KafkaBrokers {
+		cfg.KafkaBrokers[i] = strings.TrimSpace(b)
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -105,10 +123,15 @@ func (c Config) validateSink() error {
 	case "", SinkStdout:
 		return nil
 	case SinkWebhook:
+		return c.validateWebhook()
+	case SinkKafka:
+		return c.validateKafka()
 	default:
-		return fmt.Errorf("invalid SINK %q (want %s or %s)", c.Sink, SinkStdout, SinkWebhook)
+		return fmt.Errorf("invalid SINK %q (want %s, %s or %s)", c.Sink, SinkStdout, SinkWebhook, SinkKafka)
 	}
+}
 
+func (c Config) validateWebhook() error {
 	u, err := url.Parse(c.WebhookURL)
 	if err != nil || u.Host == "" {
 		return errors.New("WEBHOOK_URL must be an absolute URL")
@@ -124,6 +147,38 @@ func (c Config) validateSink() error {
 	}
 	if c.WebhookTimeout <= 0 || c.WebhookRetryMin <= 0 || c.WebhookRetryMax < c.WebhookRetryMin {
 		return errors.New("WEBHOOK_TIMEOUT and WEBHOOK_RETRY_MIN must be positive, WEBHOOK_RETRY_MAX not below WEBHOOK_RETRY_MIN")
+	}
+	return nil
+}
+
+func (c Config) validateKafka() error {
+	if len(c.KafkaBrokers) == 0 {
+		return errors.New("KAFKA_BROKERS must list at least one host:port")
+	}
+	allLoopback := true
+	for _, b := range c.KafkaBrokers {
+		host, port, err := net.SplitHostPort(b)
+		if err != nil || host == "" || port == "" {
+			return fmt.Errorf("invalid broker %q in KAFKA_BROKERS, want host:port", b)
+		}
+		allLoopback = allLoopback && isLoopback(host)
+	}
+	if !c.KafkaTLS && !allLoopback {
+		return errors.New("KAFKA_TLS must be true unless every broker is a loopback host")
+	}
+
+	switch c.KafkaSASLMechanism {
+	case "":
+	case saslPlain, saslScramSHA256, saslScramSHA512:
+		if c.KafkaSASLUsername == "" || c.KafkaSASLPassword == "" {
+			return errors.New("KAFKA_SASL_USERNAME and KAFKA_SASL_PASSWORD are required with KAFKA_SASL_MECHANISM")
+		}
+	default:
+		return fmt.Errorf("invalid KAFKA_SASL_MECHANISM %q (want %s, %s or %s)", c.KafkaSASLMechanism, saslPlain, saslScramSHA256, saslScramSHA512)
+	}
+
+	if !topicPrefixRE.MatchString(c.KafkaTopicPrefix) || len(c.KafkaTopicPrefix) > maxTopicLen/2 {
+		return fmt.Errorf("invalid KAFKA_TOPIC_PREFIX %q", c.KafkaTopicPrefix)
 	}
 	return nil
 }

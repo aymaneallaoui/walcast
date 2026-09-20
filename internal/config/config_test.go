@@ -97,7 +97,7 @@ func TestValidate_webhookSink(t *testing.T) {
 	}
 
 	rejected := map[string]func(*Config){
-		"unknown sink":            func(c *Config) { c.Sink = "kafka" },
+		"unknown sink":            func(c *Config) { c.Sink = "pulsar" },
 		"missing url":             func(c *Config) { c.WebhookURL = "" },
 		"relative url":            func(c *Config) { c.WebhookURL = "/hook" },
 		"plain http to a remote":  func(c *Config) { c.WebhookURL = "http://hooks.example.com/walcast" },
@@ -126,5 +126,56 @@ func TestValidate_stdoutIgnoresWebhookSettings(t *testing.T) {
 	cfg.WebhookURL = "not a url"
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func kafkaConfig() Config {
+	cfg := validConfig()
+	cfg.Sink = SinkKafka
+	cfg.KafkaBrokers = []string{"broker-1.example.com:9093", "broker-2.example.com:9093"}
+	cfg.KafkaTopicPrefix = "walcast."
+	cfg.KafkaTLS = true
+	return cfg
+}
+
+func TestValidate_kafkaSink(t *testing.T) {
+	accepted := map[string]func(*Config){
+		"tls to remote brokers": func(*Config) {},
+		"plaintext to loopback": func(c *Config) { c.KafkaTLS = false; c.KafkaBrokers = []string{"localhost:9092", "127.0.0.1:9093"} },
+		"scram over tls": func(c *Config) {
+			c.KafkaSASLMechanism, c.KafkaSASLUsername, c.KafkaSASLPassword = "scram-sha-512", "walcast", "secret"
+		},
+		"empty topic prefix": func(c *Config) { c.KafkaTopicPrefix = "" },
+	}
+	for name, mutate := range accepted {
+		t.Run("accepts "+name, func(t *testing.T) {
+			cfg := kafkaConfig()
+			mutate(&cfg)
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+
+	rejected := map[string]func(*Config){
+		"no brokers":            func(c *Config) { c.KafkaBrokers = nil },
+		"broker without port":   func(c *Config) { c.KafkaBrokers = []string{"broker.example.com"} },
+		"plaintext to a remote": func(c *Config) { c.KafkaTLS = false },
+		"plaintext with one remote": func(c *Config) {
+			c.KafkaTLS = false
+			c.KafkaBrokers = []string{"localhost:9092", "broker.example.com:9092"}
+		},
+		"unknown sasl mechanism":      func(c *Config) { c.KafkaSASLMechanism = "gssapi" },
+		"sasl without credentials":    func(c *Config) { c.KafkaSASLMechanism = "plain" },
+		"topic prefix with bad chars": func(c *Config) { c.KafkaTopicPrefix = "wal cast/" },
+	}
+	for name, mutate := range rejected {
+		t.Run("rejects "+name, func(t *testing.T) {
+			cfg := kafkaConfig()
+			mutate(&cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("expected a validation error")
+			}
+		})
 	}
 }
