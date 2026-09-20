@@ -93,7 +93,7 @@ SX, SW = 1190, 630
 box(SX, 270, SW, 86, "Tx ledger · delivered LSN moves only across contiguous done batches\nack = end LSN of the last whole transaction · fragments carry none\nmarker H is acked like a commit · reported LSN = delivered, capped by a hold", RED, RED_BG, 15)
 box(SX, 467, 400, 86, "byte-bounded queue\nbackpressure", VIOLET, VIOLET_BG, 16)
 box(SX, 620, SW, 86, "Dispatcher · one Send at a time · callbacks awaited\nretry in place · rejected = halt", ORANGE, ORANGE_BG, 16)
-box(SX, 770, SW, 86, "Metrics · /metrics + pprof\nlag · slot health · sink p99 · ledger depth · backfill rows", GREY, "#e9ecef", 16)
+box(SX, 770, SW, 86, "Metrics · /metrics, pprof behind a switch · off unless METRICS_ADDR is set\nLSN positions · delivery and end-to-end latency · in flight · backfill rows", GREY, "#e9ecef", 16)
 arrow([(GX + GW, 510), (SX, 510)], VIOLET)
 arrow([(1390, 553), (1390, 620)], VIOLET)
 arrow([(1720, 620), (1720, 356)], RED)
