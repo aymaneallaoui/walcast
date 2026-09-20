@@ -14,9 +14,12 @@ const (
 // Record locates one event inside a Batch. Value excludes the trailing newline and Key is the
 // row's replica identity as compact JSON, or the quoted table name when the row has none.
 type Record struct {
-	Op                   string
-	Schema, Name         string
-	Table                string
+	Op           string
+	Schema, Name string
+	Table        string
+	// Partial marks an update that left out an unchanged TOAST column: a consumer that has never
+	// seen the row cannot rebuild it from this event alone.
+	Partial              bool
 	valueStart, valueEnd int
 	keyStart, keyEnd     int
 }

@@ -305,7 +305,7 @@ func TestIgnoreTable(t *testing.T) {
 	row := tuple(text("7"), text("a"), text("t"), text("1"), null(), null())
 	newEncoder := func() *Encoder {
 		e := NewEncoder()
-		e.IgnoreTable("walcast_state", "slots")
+		e.IgnoreTables("walcast_state", "slots", "backfills")
 		e.Relation(usersRelation())
 		for id, name := range map[uint32]string{stateRelID: "slots", siblingRelID: "orders"} {
 			rel := usersRelation()
