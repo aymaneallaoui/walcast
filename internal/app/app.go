@@ -68,5 +68,7 @@ func (a *App) Run(ctx context.Context) error {
 
 // isFatal reports errors that a reconnect cannot fix: the same WAL would fail the same way.
 func isFatal(err error) bool {
-	return errors.Is(err, replication.ErrSlotUnusable) || errors.Is(err, event.ErrUnencodable)
+	return errors.Is(err, replication.ErrSlotUnusable) ||
+		errors.Is(err, event.ErrUnencodable) ||
+		errors.Is(err, sink.ErrRejected)
 }
