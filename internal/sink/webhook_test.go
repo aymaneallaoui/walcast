@@ -166,12 +166,16 @@ func TestWebhook_Send(t *testing.T) {
 
 	t.Run("client error rejects the batch without retrying", func(t *testing.T) {
 		wh, rcv := newWebhook(t, func(_ int, w http.ResponseWriter) {
-			http.Error(w, "schema mismatch", http.StatusUnprocessableEntity)
+			w.Header().Set("X-Request-Id", "req-42")
+			http.Error(w, "row for jane@example.com failed validation", http.StatusUnprocessableEntity)
 		})
 
 		err := send(t, context.Background(), wh, body)
-		if !errors.Is(err, ErrRejected) || !strings.Contains(err.Error(), "schema mismatch") {
-			t.Fatalf("err = %v, want ErrRejected with the receiver's reason", err)
+		if !errors.Is(err, ErrRejected) || !strings.Contains(err.Error(), "422") || !strings.Contains(err.Error(), "req-42") {
+			t.Fatalf("err = %v, want ErrRejected with the status and request id", err)
+		}
+		if strings.Contains(err.Error(), "jane@example.com") {
+			t.Fatalf("error echoes the receiver's response body: %v", err)
 		}
 		if n := len(rcv.seen()); n != 1 {
 			t.Fatalf("got %d requests, want 1", n)
@@ -228,6 +232,8 @@ func TestParseRetryAfter(t *testing.T) {
 		{"http date", "Wed, 21 Oct 2026 07:30:00 GMT", 2 * time.Minute},
 		{"http date in the past", "Wed, 21 Oct 2026 07:00:00 GMT", 0},
 		{"absurd value hits the ceiling", "864000", maxRetryAfter},
+		{"value that overflows a duration hits the ceiling", "9223372037", maxRetryAfter},
+		{"value beyond int64 is ignored", "99999999999999999999", 0},
 		{"empty", "", 0},
 		{"garbage", "soon", 0},
 		{"negative", "-3", 0},
@@ -270,7 +276,7 @@ func TestWebhook_postErrorsDoNotLeakTheURL(t *testing.T) {
 	}, zerolog.Nop())
 	t.Cleanup(func() { _ = wh.Close() })
 
-	_, err := wh.post(context.Background(), &event.Batch{Buf: []byte("{}\n"), Events: 1}, "key", 0)
+	_, _, err := wh.post(context.Background(), []byte("{}\n"), 1, "key", 0)
 	if err == nil {
 		t.Fatal("expected a connection error")
 	}
@@ -309,5 +315,38 @@ func BenchmarkWebhook_Send(b *testing.B) {
 				b.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestWebhook_SendNeverLetsTheTransportReadThePooledBatch(t *testing.T) {
+	release := make(chan struct{})
+	wh, rcv := newWebhook(t, func(n int, w http.ResponseWriter) {
+		if n == 1 {
+			<-release
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	t.Cleanup(func() { close(release) })
+
+	batch := &event.Batch{Buf: []byte("{\"op\":\"first\"}\n"), Events: 1}
+	ctx, cancel := context.WithCancel(context.Background())
+	settled := make(chan error, 1)
+	go wh.Send(ctx, batch, func(err error) { settled <- err })
+	for len(rcv.seen()) == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	if err := <-settled; !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+
+	copy(batch.Buf, "XXXXXXXXXXXXXXXX")
+	if err := send(t, context.Background(), wh, "{\"op\":\"second\"}\n"); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range rcv.seen() {
+		if strings.Contains(r.body, "XXXX") {
+			t.Fatalf("receiver saw bytes of a recycled batch: %q", r.body)
+		}
 	}
 }
