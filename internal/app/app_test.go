@@ -19,6 +19,7 @@ func TestRunStopsOnContextCancelWhileRetrying(t *testing.T) {
 		SettleTimeout:     time.Minute,
 		SlotName:          "walcast_slot",
 		PublicationName:   "walcast_pub",
+		StateSchema:       "walcast_state",
 		FeedbackInterval:  time.Second,
 		ServerTimeout:     time.Minute,
 		BatchMaxBytes:     1 << 16,
