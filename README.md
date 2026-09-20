@@ -2,8 +2,6 @@
 
 Postgres change data capture pipeline. Streams row changes from the write-ahead log over logical replication (`pgoutput`) and emits them as JSON.
 
-Status: replication core with a stdout sink. Webhook and Kafka sinks, crash-recovery tests, initial snapshot and metrics are next.
-
 ![architecture](docs/architecture.png)
 
 ## Dev
