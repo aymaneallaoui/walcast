@@ -50,7 +50,7 @@ type Config struct {
 	SlotRecreateGeneration int    `env:"SLOT_RECREATE_GENERATION" envDefault:"0"`
 
 	BackfillTables     []string `env:"BACKFILL_TABLES"`
-	BackfillChunkRows  int      `env:"BACKFILL_CHUNK_ROWS" envDefault:"2000"`
+	BackfillChunkRows  int      `env:"BACKFILL_CHUNK_ROWS" envDefault:"10000"`
 	BackfillChunkBytes int      `env:"BACKFILL_CHUNK_BYTES" envDefault:"4194304"`
 
 	FeedbackInterval time.Duration `env:"FEEDBACK_INTERVAL" envDefault:"5s"`
