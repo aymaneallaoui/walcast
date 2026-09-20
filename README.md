@@ -122,7 +122,7 @@ Set `METRICS_ADDR` (for example `127.0.0.1:9090`) to serve Prometheus metrics on
 | `walcast_backfill_rows_total`, `walcast_backfill_chunks_total` | backfill progress |
 | `walcast_backfill_rows_superseded_total`, `walcast_backfill_rows_reread_total` | chunk rows dropped because the stream had a newer complete image, and rows read again |
 
-Each latency is exposed twice: as a summary with `quantile` labels that read directly, and as `<name>_hist` with Prometheus `le` buckets, which can be aggregated across instances. Go runtime and process metrics are included. Throughput numbers, a CPU profile and what measuring found are in [docs/performance.md](docs/performance.md).
+Each latency is exposed twice: as a summary with `quantile` labels that read directly, and as `<name>_hist` with Prometheus `le` buckets, which can be aggregated across instances. Go runtime and process metrics are included. Throughput numbers, a CPU profile and what measuring found are in [PERFORMANCE.md](PERFORMANCE.md).
 
 ## Delivery
 
