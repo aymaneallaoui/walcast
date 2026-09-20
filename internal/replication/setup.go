@@ -73,11 +73,21 @@ func warnOnPublicationDrift(ctx context.Context, conn *pgconn.PgConn, log zerolo
 	}
 	slices.Sort(published)
 
-	if want := qualified(tables); allTables || !slices.Equal(want, published) {
+	if want := qualified(tables); publicationDrifted(allTables, want, published) {
 		log.Warn().Str("publication", name).Strs("configured", want).Strs("published", published).Bool("all_tables", allTables).
 			Msg("existing publication differs from PUBLICATION_TABLES and is left untouched")
 	}
 	return nil
+}
+
+// publicationDrifted compares scope before contents: an all-tables config against a table-scoped
+// publication is drift even when that publication is empty and both lists compare equal.
+func publicationDrifted(publishesAll bool, want, published []string) bool {
+	wantsAll := len(want) == 0
+	if publishesAll || wantsAll {
+		return publishesAll != wantsAll
+	}
+	return !slices.Equal(want, published)
 }
 
 func qualified(tables []string) []string {
