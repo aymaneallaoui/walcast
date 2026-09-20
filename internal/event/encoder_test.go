@@ -297,38 +297,60 @@ func TestReplicaIdentityFullHasNoStableKey(t *testing.T) {
 	}
 }
 
-func TestIgnoredSchemaProducesNoEvents(t *testing.T) {
-	const stateRelID = usersRelID + 1
-	e := NewEncoder()
-	e.IgnoreSchema("walcast")
-	e.Relation(usersRelation())
-	state := usersRelation()
-	state.RelationID, state.Namespace, state.RelationName = stateRelID, "walcast", "slots"
-	e.Relation(state)
-	e.Begin(&pglogrepl.BeginMessage{FinalLSN: 1, Xid: 1})
-
+func TestIgnoreTable(t *testing.T) {
+	const (
+		stateRelID   = usersRelID + 1
+		siblingRelID = usersRelID + 2
+	)
 	row := tuple(text("7"), text("a"), text("t"), text("1"), null(), null())
-	b := &Batch{}
-	steps := map[string]func() error{
-		"insert":   func() error { return e.Insert(b, 1, &pglogrepl.InsertMessage{RelationID: stateRelID, Tuple: row}) },
-		"update":   func() error { return e.Update(b, 1, &pglogrepl.UpdateMessage{RelationID: stateRelID, NewTuple: row}) },
-		"delete":   func() error { return e.Delete(b, 1, &pglogrepl.DeleteMessage{RelationID: stateRelID, OldTuple: row}) },
-		"truncate": func() error { return e.Truncate(b, 1, &pglogrepl.TruncateMessage{RelationIDs: []uint32{stateRelID}}) },
-	}
-	for name, step := range steps {
-		if err := step(); err != nil {
-			t.Fatalf("%s: %v", name, err)
+	newEncoder := func() *Encoder {
+		e := NewEncoder()
+		e.IgnoreTable("walcast_state", "slots")
+		e.Relation(usersRelation())
+		for id, name := range map[uint32]string{stateRelID: "slots", siblingRelID: "orders"} {
+			rel := usersRelation()
+			rel.RelationID, rel.Namespace, rel.RelationName = id, "walcast_state", name
+			e.Relation(rel)
 		}
-		if b.Dirty() || b.Events != 0 {
-			t.Fatalf("%s on the state schema produced an event: %s", name, b.Buf)
-		}
+		e.Begin(&pglogrepl.BeginMessage{FinalLSN: 1, Xid: 1})
+		return e
 	}
 
-	if err := e.Insert(b, 1, &pglogrepl.InsertMessage{RelationID: usersRelID, Tuple: row}); err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name   string
+		relID  uint32
+		change func(e *Encoder, b *Batch, relID uint32) error
+		want   int
+	}{
+		{"insert into the state table", stateRelID, func(e *Encoder, b *Batch, id uint32) error {
+			return e.Insert(b, 1, &pglogrepl.InsertMessage{RelationID: id, Tuple: row})
+		}, 0},
+		{"update of the state table", stateRelID, func(e *Encoder, b *Batch, id uint32) error {
+			return e.Update(b, 1, &pglogrepl.UpdateMessage{RelationID: id, NewTuple: row})
+		}, 0},
+		{"delete from the state table", stateRelID, func(e *Encoder, b *Batch, id uint32) error {
+			return e.Delete(b, 1, &pglogrepl.DeleteMessage{RelationID: id, OldTuple: row})
+		}, 0},
+		{"truncate of the state table with a user table", stateRelID, func(e *Encoder, b *Batch, id uint32) error {
+			return e.Truncate(b, 1, &pglogrepl.TruncateMessage{RelationIDs: []uint32{id, usersRelID}})
+		}, 1},
+		{"user table in the same schema still streams", siblingRelID, func(e *Encoder, b *Batch, id uint32) error {
+			return e.Insert(b, 1, &pglogrepl.InsertMessage{RelationID: id, Tuple: row})
+		}, 1},
+		{"table with the same name in another schema still streams", usersRelID, func(e *Encoder, b *Batch, id uint32) error {
+			return e.Insert(b, 1, &pglogrepl.InsertMessage{RelationID: id, Tuple: row})
+		}, 1},
 	}
-	if b.Events != 1 {
-		t.Fatalf("events = %d, want the public table to still stream", b.Events)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := &Batch{}
+			if err := tt.change(newEncoder(), b, tt.relID); err != nil {
+				t.Fatal(err)
+			}
+			if b.Events != tt.want {
+				t.Fatalf("events = %d, want %d: %s", b.Events, tt.want, b.Buf)
+			}
+		})
 	}
 }
 

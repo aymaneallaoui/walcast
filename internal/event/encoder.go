@@ -36,13 +36,11 @@ type relation struct {
 	name    string
 	table   []byte
 	keyed   bool
-	ignored bool
 	cols    []column
 }
 
 type Encoder struct {
 	rels      map[uint32]*relation
-	ignore    string
 	commitLSN pglogrepl.LSN
 	xid       uint32
 	seq       uint64
@@ -50,26 +48,41 @@ type Encoder struct {
 	unchanged [][]byte
 	recStart  int
 	op        string
+
+	ignoreSchema string
+	ignoreName   string
+	ignored      map[uint32]struct{}
 }
 
 func NewEncoder() *Encoder {
 	return &Encoder{rels: make(map[uint32]*relation)}
 }
 
-// IgnoreSchema drops every change to tables in schema. walcast keeps its own state in the source
-// database, and an all-tables publication would otherwise stream those writes to consumers.
-func (e *Encoder) IgnoreSchema(schema string) {
-	e.ignore = schema
+// IgnoreTable drops every change to one table: walcast's own state table, which an all-tables
+// publication would otherwise stream. It is never a whole schema, so no user table can vanish.
+func (e *Encoder) IgnoreTable(schema, name string) {
+	e.ignoreSchema, e.ignoreName = schema, name
 }
 
+// Relation keeps ignored tables out of rels, so the per-event lookup costs what it did before
+// IgnoreTable existed and the ignore check runs only when that lookup misses.
 func (e *Encoder) Relation(m *pglogrepl.RelationMessage) {
+	if e.ignoreName != "" && m.Namespace == e.ignoreSchema && m.RelationName == e.ignoreName {
+		if e.ignored == nil {
+			e.ignored = make(map[uint32]struct{})
+		}
+		e.ignored[m.RelationID] = struct{}{}
+		delete(e.rels, m.RelationID)
+		return
+	}
+	delete(e.ignored, m.RelationID)
+
 	name := m.Namespace + "." + m.RelationName
 	rel := &relation{
 		schema:  m.Namespace,
 		relname: m.RelationName,
 		name:    name,
 		table:   appendString(nil, []byte(name)),
-		ignored: e.ignore != "" && m.Namespace == e.ignore,
 		cols:    make([]column, len(m.Columns)),
 	}
 	for i, c := range m.Columns {
@@ -95,7 +108,7 @@ func (e *Encoder) Begin(m *pglogrepl.BeginMessage) {
 
 func (e *Encoder) Insert(b *Batch, lsn pglogrepl.LSN, m *pglogrepl.InsertMessage) error {
 	rel, err := e.relation(m.RelationID)
-	if err != nil || rel.ignored {
+	if rel == nil {
 		return err
 	}
 	e.header(b, rel, OpInsert, "", lsn)
@@ -107,7 +120,7 @@ func (e *Encoder) Insert(b *Batch, lsn pglogrepl.LSN, m *pglogrepl.InsertMessage
 
 func (e *Encoder) Update(b *Batch, lsn pglogrepl.LSN, m *pglogrepl.UpdateMessage) error {
 	rel, err := e.relation(m.RelationID)
-	if err != nil || rel.ignored {
+	if rel == nil {
 		return err
 	}
 	if rel.keyed && m.OldTupleType == pglogrepl.UpdateMessageTupleTypeKey && keyChanged(rel, m.OldTuple, m.NewTuple) {
@@ -159,7 +172,7 @@ func keyChanged(rel *relation, old, updated *pglogrepl.TupleData) bool {
 
 func (e *Encoder) Delete(b *Batch, lsn pglogrepl.LSN, m *pglogrepl.DeleteMessage) error {
 	rel, err := e.relation(m.RelationID)
-	if err != nil || rel.ignored {
+	if rel == nil {
 		return err
 	}
 	e.header(b, rel, OpDelete, "", lsn)
@@ -176,7 +189,7 @@ func (e *Encoder) Truncate(b *Batch, lsn pglogrepl.LSN, m *pglogrepl.TruncateMes
 		if err != nil {
 			return err
 		}
-		if rel.ignored {
+		if rel == nil {
 			continue
 		}
 		e.header(b, rel, OpTruncate, "", lsn)
@@ -187,12 +200,20 @@ func (e *Encoder) Truncate(b *Batch, lsn pglogrepl.LSN, m *pglogrepl.TruncateMes
 	return nil
 }
 
+// relation returns nil without an error for an ignored table. The miss path lives in its own
+// function so that this one stays within the inlining budget.
 func (e *Encoder) relation(id uint32) (*relation, error) {
-	rel, ok := e.rels[id]
-	if !ok {
-		return nil, fmt.Errorf("%w: unknown relation id %d", ErrUnencodable, id)
+	if rel, ok := e.rels[id]; ok {
+		return rel, nil
 	}
-	return rel, nil
+	return nil, e.missing(id)
+}
+
+func (e *Encoder) missing(id uint32) error {
+	if _, ignored := e.ignored[id]; ignored {
+		return nil
+	}
+	return fmt.Errorf("%w: unknown relation id %d", ErrUnencodable, id)
 }
 
 func (e *Encoder) header(b *Batch, rel *relation, op, origin string, lsn pglogrepl.LSN) {
