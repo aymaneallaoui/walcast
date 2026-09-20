@@ -105,6 +105,25 @@ A 2xx response means the batch is safely stored on your side: only then is its L
 - Table names that cannot map to a topic unambiguously (quoted identifiers with dots, spaces or non-ASCII, over 249 bytes with the prefix) are sanitised and get a short hash of the exact schema and table, so two tables never share a topic; the chosen topic is logged.
 - A record above `KAFKA_MAX_MESSAGE_BYTES` stops the process. The error names the topic, the size and the event's `commit_lsn` and `seq`, never the row key or data. Raise it together with the topic's `max.message.bytes`.
 
+## Metrics
+
+Set `METRICS_ADDR` (for example `127.0.0.1:9090`) to serve Prometheus metrics on `/metrics`. Nothing listens unless it is set. `PPROF_ENABLED=true` adds `/debug/pprof/` to the same listener; it exposes process internals and can be used to load the process, so keep it on loopback, and walcast warns when it is not.
+
+| Metric | Meaning |
+| --- | --- |
+| `walcast_events_delivered_total{op}` | events the sink confirmed, by `insert`, `update`, `delete`, `truncate`, `read` |
+| `walcast_batches_delivered_total`, `walcast_bytes_delivered_total` | delivered batches and their JSON bytes |
+| `walcast_delivery_failures_total`, `walcast_sink_retries_total` | failed deliveries that ended a session, and webhook retries |
+| `walcast_sink_delivery_seconds` | time a batch spent in the sink |
+| `walcast_end_to_end_seconds` | from the oldest commit in a batch to its delivery, so no event in the batch waited longer |
+| `walcast_received_lsn`, `walcast_delivered_lsn`, `walcast_reported_lsn` | stream positions; received minus reported is the backlog in WAL bytes, and reported stays behind delivered while an ack is held back |
+| `walcast_inflight_batches`, `walcast_inflight_bytes` | what the sink has not confirmed yet |
+| `walcast_streaming`, `walcast_reconnects_total` | 1 while a session is up, and how often one had to be restarted |
+| `walcast_backfill_rows_total`, `walcast_backfill_chunks_total` | backfill progress |
+| `walcast_backfill_rows_superseded_total`, `walcast_backfill_rows_reread_total` | chunk rows dropped because the stream had a newer complete image, and rows read again |
+
+Each latency is exposed twice: as a summary with `quantile` labels that read directly, and as `<name>_hist` with Prometheus `le` buckets, which can be aggregated across instances. Go runtime and process metrics are included. Throughput numbers, a CPU profile and what measuring found are in [docs/performance.md](docs/performance.md).
+
 ## Delivery
 
 At-least-once. A transaction's end LSN is confirmed to Postgres only after every batch holding its events, and every batch before it, has been delivered by the sink. A restart or reconnect resumes from the slot's confirmed LSN, so unconfirmed events are replayed, never lost. The stdout sink is best-effort: a successful write is treated as delivered. The webhook sink treats a 2xx response as delivered, the Kafka sink a broker acknowledgement of every record.
@@ -126,8 +145,10 @@ Read from the environment. A `.env` file is loaded if present and never override
 | `STATE_SCHEMA` | `walcast_state` | schema in the source database for walcast's own state; not `public` or a system schema, and not the database role's name, because `search_path` starts with `"$user"` and the role's unqualified tables would land in it |
 | `SLOT_RECREATE_GENERATION` | `0` | set to the value from the "slot is gone" error to recreate a lost slot and accept the gap; each value works for one start only |
 | `BACKFILL_TABLES` | off | comma separated `schema.table` list, or `all` for every table of the publication; see Backfill |
-| `BACKFILL_CHUNK_ROWS` | `2000` | rows per chunk; shrinks by itself when a chunk hits the byte budget |
+| `BACKFILL_CHUNK_ROWS` | `10000` | rows per chunk; shrinks by itself when a chunk hits the byte budget |
 | `BACKFILL_CHUNK_BYTES` | `4194304` | memory budget for one chunk's rows |
+| `METRICS_ADDR` | off | `host:port` for `/metrics`, for example `127.0.0.1:9090` |
+| `PPROF_ENABLED` | `false` | serve `/debug/pprof/` on the metrics listener; needs `METRICS_ADDR` |
 | `LOG_LEVEL` | `info` | `trace`, `debug`, `info`, `warn`, `error` |
 | `LOG_FORMAT` | `json` | `json` or `console` |
 | `SHUTDOWN_TIMEOUT` | `10s` | drain deadline on SIGINT/SIGTERM |
@@ -164,6 +185,7 @@ internal/event         pgoutput to JSON encoder, pooled batches
 internal/ledger        in-order ack tracking
 internal/sink          Sink interface, writer, webhook and Kafka sinks
 internal/backoff       jittered exponential backoff
+internal/metrics       metrics set, /metrics and pprof listener
 internal/config        env config
 internal/logger        zerolog setup
 ```
