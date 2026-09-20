@@ -54,16 +54,15 @@ A 2xx response means the batch is safely stored on your side: only then is its L
 - An update that changes the primary key is keyed by the new value, so it can land in a different partition than the row's earlier changes.
 - The producer is idempotent with `acks=all`: broker-side retries neither duplicate nor reorder records within a partition. A replay after a restart can still duplicate, so deduplicate on `commit_lsn` + `seq`.
 - An LSN is confirmed to Postgres only after every record of its batch was acknowledged by the brokers. Errors Kafka marks non-retriable (record too large, authorization, invalid topic) stop the process.
-- TLS is required unless every broker is a loopback host. SASL `plain`, `scram-sha-256` and `scram-sha-512` are supported. A private CA is picked up from the system pool, which `SSL_CERT_FILE` or `SSL_CERT_DIR` can point at.
-- Table names that are not legal topic names (quoted identifiers, over 249 bytes with the prefix) are sanitised and get a short hash suffix; the chosen topic is logged.
-- A record above `KAFKA_MAX_MESSAGE_BYTES` stops the process with the topic, key and size in the error. Raise it together with the topic's `max.message.bytes`.
-- If the key columns of an updated row are TOASTed and unchanged, Postgres does not resend them and the key cannot be rebuilt, so that event is not guaranteed to share a partition with the row's other changes. This needs a key column over roughly 2 KB.
+- TLS is required unless every broker is a loopback host, and always with SASL (`plain`, `scram-sha-256`, `scram-sha-512`). Without TLS, traffic also goes in plaintext to whatever brokers the bootstrap ones advertise. A private CA is picked up from the system pool, which `SSL_CERT_FILE` or `SSL_CERT_DIR` can point at.
+- Table names that cannot map to a topic unambiguously (quoted identifiers with dots, spaces or non-ASCII, over 249 bytes with the prefix) are sanitised and get a short hash of the exact schema and table, so two tables never share a topic; the chosen topic is logged.
+- A record above `KAFKA_MAX_MESSAGE_BYTES` stops the process. The error names the topic, the size and the event's `commit_lsn` and `seq`, never the row key or data. Raise it together with the topic's `max.message.bytes`.
 
 ## Delivery
 
 At-least-once. A transaction's end LSN is confirmed to Postgres only after every batch holding its events, and every batch before it, has been delivered by the sink. A restart or reconnect resumes from the slot's confirmed LSN, so unconfirmed events are replayed, never lost. The stdout sink is best-effort: a successful write is treated as delivered. The webhook sink treats a 2xx response as delivered, the Kafka sink a broker acknowledgement of every record.
 
-Deterministic failures (an unencodable change, an unusable slot, a batch the webhook receiver or Kafka rejects for good) stop the process instead of retrying forever.
+Failures a reconnect cannot fix (an unencodable change, an unusable slot, deliveries that never settle, a batch the webhook receiver or Kafka rejects for good) stop the process instead of retrying forever.
 
 Large transactions are split across batches; only the batch holding the commit carries an LSN to confirm. A slow sink applies backpressure to Postgres while status updates keep flowing, so `wal_sender_timeout` does not drop the connection. Transactions are decoded with protocol version 1, so Postgres buffers a transaction until it commits.
 
@@ -80,6 +79,7 @@ Read from the environment. A `.env` file is loaded if present and never override
 | `LOG_LEVEL` | `info` | `trace`, `debug`, `info`, `warn`, `error` |
 | `LOG_FORMAT` | `json` | `json` or `console` |
 | `SHUTDOWN_TIMEOUT` | `10s` | drain deadline on SIGINT/SIGTERM |
+| `SINK_SETTLE_TIMEOUT` | `5m` | after a failed session, how long to wait for its in-flight deliveries before exiting so a restart can drop the stuck client |
 | `FEEDBACK_INTERVAL` | `5s` | standby status updates, keep well under `wal_sender_timeout` |
 | `SERVER_TIMEOUT` | `60s` | reconnect when Postgres sends nothing for this long |
 | `BATCH_MAX_BYTES` | `65536` | batch size before it is sealed |
