@@ -140,6 +140,8 @@ func newHarness(t *testing.T, tune func(*config.Config)) *harness {
 			fmt.Sprintf("DROP TABLE IF EXISTS %s", h.table),
 			fmt.Sprintf("DO $$ BEGIN IF to_regclass('%[1]s.slots') IS NOT NULL THEN DELETE FROM %[1]s.slots WHERE slot_name = '%[2]s'; END IF; END $$",
 				h.cfg.StateSchema, h.cfg.SlotName),
+			fmt.Sprintf("DO $$ BEGIN IF to_regclass('%[1]s.backfills') IS NOT NULL THEN DELETE FROM %[1]s.backfills WHERE table_name = 'public.%[2]s'; END IF; END $$",
+				h.cfg.StateSchema, h.table),
 		} {
 			if _, err := admin.Exec(context.Background(), sql).ReadAll(); err != nil {
 				t.Errorf("cleanup %q: %v", sql, err)
