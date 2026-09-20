@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -132,7 +133,7 @@ func (w *Webhook) post(ctx context.Context, b *event.Batch, key string, attempt 
 
 	resp, err := w.client.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("post: %w", err)
+		return 0, fmt.Errorf("post: %w", withoutURL(err))
 	}
 	defer func() {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, drainLimit))
@@ -148,6 +149,15 @@ func (w *Webhook) post(ctx context.Context, b *event.Batch, key string, attempt 
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, errorBodyLimit))
 		return 0, fmt.Errorf("%w: %s: %s", ErrRejected, resp.Status, bytes.TrimSpace(snippet))
 	}
+}
+
+// withoutURL drops the request URL that net/http puts in its errors: these errors are logged on
+// every retry, and webhook URLs often carry a token in the path or query.
+func withoutURL(err error) error {
+	if urlErr, ok := errors.AsType[*url.Error](err); ok {
+		return urlErr.Err
+	}
+	return err
 }
 
 func retryable(status int) bool {
