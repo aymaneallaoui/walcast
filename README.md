@@ -18,6 +18,8 @@ Other targets: `make build`, `make test`, `make test-integration` (uses `DATABAS
 
 The publication and the replication slot are created on first start if missing. An existing publication is never altered; a mismatch with `PUBLICATION_TABLES` is logged. If the slot disappears or is invalidated while walcast runs, it exits instead of recreating it, because a fresh slot would silently skip every change made in between.
 
+walcast also remembers the slot in the source database, in `STATE_SCHEMA.slots`, so the same protection holds across restarts. When the table knows a slot that no longer exists (dropped by hand, lost in a failover or a restore), walcast refuses to start and prints the exact `SLOT_RECREATE_GENERATION` value that accepts the gap. That value works once: after the slot is recreated the stored generation moves on, so leaving the variable set cannot hide a second loss. A slot that already exists without a row is adopted. The role needs `CREATE` on the database for the first start and write access to the state schema afterwards. Changes to tables in the state schema are never emitted as events.
+
 ## Events
 
 One JSON object per line:
@@ -77,6 +79,8 @@ Read from the environment. A `.env` file is loaded if present and never override
 | `SLOT_NAME` | `walcast_slot` | lowercase letters, digits, underscore |
 | `PUBLICATION_NAME` | `walcast_pub` | same charset |
 | `PUBLICATION_TABLES` | all tables | comma separated `schema.table`; all tables needs superuser |
+| `STATE_SCHEMA` | `walcast_state` | schema in the source database for walcast's own state; must differ from the database role, because `search_path` starts with `"$user"` and the role's unqualified tables would land in it |
+| `SLOT_RECREATE_GENERATION` | `0` | set to the value from the "slot is gone" error to recreate a lost slot once and accept the gap |
 | `LOG_LEVEL` | `info` | `trace`, `debug`, `info`, `warn`, `error` |
 | `LOG_FORMAT` | `json` | `json` or `console` |
 | `SHUTDOWN_TIMEOUT` | `10s` | drain deadline on SIGINT/SIGTERM |
@@ -108,7 +112,7 @@ Read from the environment. A `.env` file is loaded if present and never override
 ```
 cmd/walcast            entrypoint, signal handling
 internal/app           supervisor: reconnect with backoff
-internal/replication   connection, publication + slot setup, receive loop, feedback
+internal/replication   connection, publication + slot setup, slot state table, receive loop, feedback
 internal/event         pgoutput to JSON encoder, pooled batches
 internal/ledger        in-order ack tracking
 internal/sink          Sink interface, writer, webhook and Kafka sinks
