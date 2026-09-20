@@ -153,6 +153,58 @@ func TestSeqIncrementsWithinTransaction(t *testing.T) {
 	}
 }
 
+func TestRecordsCarryValueKeyAndTable(t *testing.T) {
+	e := newTestEncoder()
+	b := &Batch{}
+	if err := e.Insert(b, 1, &pglogrepl.InsertMessage{RelationID: usersRelID, Tuple: tuple(text("7"), text("a"), text("t"), text("1"), null(), null())}); err != nil {
+		t.Fatal(err)
+	}
+	del := &pglogrepl.DeleteMessage{RelationID: usersRelID, OldTupleType: pglogrepl.DeleteMessageTupleTypeKey, OldTuple: tuple(text("9"), null(), null(), null(), null(), null())}
+	if err := e.Delete(b, 2, del); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Truncate(b, 3, &pglogrepl.TruncateMessage{RelationIDs: []uint32{usersRelID}}); err != nil {
+		t.Fatal(err)
+	}
+
+	wantKeys := []string{`{"id":7}`, `{"id":9}`, `"public.users"`}
+	if len(b.Records) != 3 {
+		t.Fatalf("got %d records, want 3", len(b.Records))
+	}
+	var joined []byte
+	for i, r := range b.Records {
+		if r.Table != "public.users" || string(b.Key(r)) != wantKeys[i] {
+			t.Errorf("record %d: table=%q key=%s, want key %s", i, r.Table, b.Key(r), wantKeys[i])
+		}
+		if v := b.Value(r); !json.Valid(v) || v[len(v)-1] == '\n' {
+			t.Errorf("record %d value is not one bare JSON object: %q", i, v)
+		}
+		joined = append(append(joined, b.Value(r)...), '\n')
+	}
+	if string(joined) != string(b.Buf) {
+		t.Error("record values do not tile the batch buffer")
+	}
+}
+
+func TestReplicaIdentityFullHasNoStableKey(t *testing.T) {
+	e := NewEncoder()
+	rel := usersRelation()
+	rel.ReplicaIdentity = replicaIdentityFull
+	for _, c := range rel.Columns {
+		c.Flags = 1
+	}
+	e.Relation(rel)
+	e.Begin(&pglogrepl.BeginMessage{FinalLSN: 1, Xid: 1})
+
+	b := &Batch{}
+	if err := e.Insert(b, 1, &pglogrepl.InsertMessage{RelationID: usersRelID, Tuple: tuple(text("7"), text("a"), text("t"), text("1"), null(), null())}); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(b.Key(b.Records[0])); got != `"public.users"` {
+		t.Fatalf("key = %s, want the table name", got)
+	}
+}
+
 func TestUnknownRelationIsUnencodable(t *testing.T) {
 	e := NewEncoder()
 	err := e.Insert(&Batch{}, 1, &pglogrepl.InsertMessage{RelationID: 1, Tuple: tuple()})
@@ -171,7 +223,7 @@ func BenchmarkInsert(b *testing.B) {
 
 	b.ReportAllocs()
 	for b.Loop() {
-		batch.Buf = batch.Buf[:0]
+		batch.Buf, batch.Keys, batch.Records = batch.Buf[:0], batch.Keys[:0], batch.Records[:0]
 		if err := e.Insert(batch, 0x16B3700, msg); err != nil {
 			b.Fatal(err)
 		}

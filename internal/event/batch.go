@@ -11,12 +11,26 @@ const (
 	maxPooledCap    = 4 * initialBatchCap
 )
 
-type Batch struct {
-	Buf    []byte
-	Events int
-	Seq    uint64
-	AckLSN pglogrepl.LSN
+// Record locates one event inside a Batch. Value excludes the trailing newline and Key is the
+// row's replica identity as compact JSON, or the quoted table name when the row has none.
+type Record struct {
+	Table                string
+	valueStart, valueEnd int
+	keyStart, keyEnd     int
 }
+
+type Batch struct {
+	Buf     []byte
+	Keys    []byte
+	Records []Record
+	Events  int
+	Seq     uint64
+	AckLSN  pglogrepl.LSN
+}
+
+func (b *Batch) Value(r Record) []byte { return b.Buf[r.valueStart:r.valueEnd] }
+
+func (b *Batch) Key(r Record) []byte { return b.Keys[r.keyStart:r.keyEnd] }
 
 var batchPool = sync.Pool{
 	New: func() any { return &Batch{Buf: make([]byte, 0, initialBatchCap)} },
@@ -33,6 +47,8 @@ func (b *Batch) Release() {
 		return
 	}
 	b.Buf = b.Buf[:0]
+	b.Keys = b.Keys[:0]
+	b.Records = b.Records[:0]
 	b.Events = 0
 	b.Seq = 0
 	b.AckLSN = 0

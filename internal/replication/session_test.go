@@ -419,7 +419,7 @@ func BenchmarkSession_handleXLogData(b *testing.B) {
 
 	b.ReportAllocs()
 	for b.Loop() {
-		s.cur.Buf = s.cur.Buf[:0]
+		s.cur.Buf, s.cur.Keys, s.cur.Records = s.cur.Buf[:0], s.cur.Keys[:0], s.cur.Records[:0]
 		if err := s.handleXLogData(data); err != nil {
 			b.Fatal(err)
 		}
