@@ -27,6 +27,7 @@ One JSON object per line:
 ```
 
 - `op` is `insert`, `update`, `delete` or `truncate`.
+- An update that changes the row's replica identity (its primary key) is emitted as a `delete` of the old key followed by an `insert` of the new one, both carrying `"origin":"update"`. Every key's history then stays self-consistent for consumers partitioned by key.
 - `commit_lsn` + `seq` identify an event; use them to deduplicate.
 - `old` holds the replica identity columns only, or the full row with `REPLICA IDENTITY FULL`.
 - `unchanged` lists TOASTed columns Postgres did not resend. They are absent from `new`, not null.
@@ -51,7 +52,7 @@ A 2xx response means the batch is safely stored on your side: only then is its L
 
 - Value: the event JSON. Key: the row's replica identity as compact JSON, for example `{"id":7}`. All changes of a row share a partition, so consumers see them in commit order.
 - Rows without a stable identity (no primary key, `REPLICA IDENTITY FULL` or `NOTHING`, truncates) are keyed by table name, which keeps them ordered in one partition.
-- An update that changes the primary key is keyed by the new value, so it can land in a different partition than the row's earlier changes.
+- Truncates are not sent unless `KAFKA_EMIT_TRUNCATE=true`. A truncate is keyed by table while rows are keyed by identity, so a consumer could read it after a later insert from another partition and wipe that new row. A skipped truncate is logged.
 - The producer is idempotent with `acks=all`: broker-side retries neither duplicate nor reorder records within a partition. A replay after a restart can still duplicate, so deduplicate on `commit_lsn` + `seq`.
 - An LSN is confirmed to Postgres only after every record of its batch was acknowledged by the brokers. Errors Kafka marks non-retriable (record too large, authorization, invalid topic) stop the process.
 - TLS is required unless every broker is a loopback host, and always with SASL (`plain`, `scram-sha-256`, `scram-sha-512`). Without TLS, traffic also goes in plaintext to whatever brokers the bootstrap ones advertise. A private CA is picked up from the system pool, which `SSL_CERT_FILE` or `SSL_CERT_DIR` can point at.
@@ -99,6 +100,7 @@ Read from the environment. A `.env` file is loaded if present and never override
 | `KAFKA_TLS` | `false` | must be `true` unless every broker is a loopback host |
 | `KAFKA_SASL_MECHANISM` | none | `plain`, `scram-sha-256` or `scram-sha-512` |
 | `KAFKA_SASL_USERNAME` / `KAFKA_SASL_PASSWORD` | | required with a mechanism |
+| `KAFKA_EMIT_TRUNCATE` | `false` | send truncate events, see the ordering caveat above |
 | `KAFKA_MAX_MESSAGE_BYTES` | `1000012` | largest record batch, match the topic's `max.message.bytes` |
 
 ## Layout
