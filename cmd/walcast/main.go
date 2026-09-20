@@ -12,6 +12,7 @@ import (
 	"github.com/aymaneallaoui/walcast/internal/app"
 	"github.com/aymaneallaoui/walcast/internal/config"
 	"github.com/aymaneallaoui/walcast/internal/logger"
+	"github.com/aymaneallaoui/walcast/internal/metrics"
 	"github.com/aymaneallaoui/walcast/internal/sink"
 )
 
@@ -36,14 +37,31 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	snk, err := newSink(cfg, log)
+	m := metrics.New()
+	served := make(chan error, 1)
+	if cfg.MetricsAddr == "" {
+		close(served)
+	} else {
+		ln, err := metrics.Listen(cfg.MetricsAddr)
+		if err != nil {
+			return err
+		}
+		go func() { served <- metrics.Serve(ctx, ln, m, cfg.PprofEnabled, log) }()
+	}
+
+	snk, err := newSink(cfg, log, m)
 	if err != nil {
 		return err
 	}
-	return app.New(cfg, log, snk).Run(ctx)
+	err = app.New(cfg, log, snk).WithMetrics(m).Run(ctx)
+	stop()
+	if serveErr := <-served; serveErr != nil {
+		log.Warn().Err(serveErr).Msg("metrics listener ended with an error")
+	}
+	return err
 }
 
-func newSink(cfg config.Config, log zerolog.Logger) (sink.Sink, error) {
+func newSink(cfg config.Config, log zerolog.Logger, m *metrics.Metrics) (sink.Sink, error) {
 	switch cfg.Sink {
 	case config.SinkWebhook:
 		return sink.NewWebhook(sink.WebhookConfig{
@@ -52,6 +70,7 @@ func newSink(cfg config.Config, log zerolog.Logger) (sink.Sink, error) {
 			Timeout:  cfg.WebhookTimeout,
 			RetryMin: cfg.WebhookRetryMin,
 			RetryMax: cfg.WebhookRetryMax,
+			OnRetry:  m.SinkRetries.Inc,
 		}, log), nil
 	case config.SinkKafka:
 		return sink.NewKafka(sink.KafkaConfig{

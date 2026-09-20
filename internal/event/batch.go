@@ -31,6 +31,9 @@ type Batch struct {
 	Events  int
 	Seq     uint64
 	AckLSN  pglogrepl.LSN
+	// CommitNanos is when the oldest transaction that ends in this batch committed on the source, in
+	// Unix nanoseconds: no event in the batch waited longer. It stays zero for a fragment.
+	CommitNanos int64
 }
 
 func (b *Batch) Value(r Record) []byte { return b.Buf[r.valueStart:r.valueEnd] }
@@ -57,6 +60,7 @@ func (b *Batch) Release() {
 	b.Events = 0
 	b.Seq = 0
 	b.AckLSN = 0
+	b.CommitNanos = 0
 	batchPool.Put(b)
 }
 

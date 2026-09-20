@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pglogrepl"
@@ -16,6 +17,7 @@ import (
 	"github.com/aymaneallaoui/walcast/internal/config"
 	"github.com/aymaneallaoui/walcast/internal/event"
 	"github.com/aymaneallaoui/walcast/internal/ledger"
+	"github.com/aymaneallaoui/walcast/internal/metrics"
 	"github.com/aymaneallaoui/walcast/internal/sink"
 )
 
@@ -45,10 +47,35 @@ type Runner struct {
 
 	established  bool
 	lastDispatch <-chan struct{}
+
+	metrics *metrics.Metrics
+	// live is the session whose positions the gauges report. They are registered once and read
+	// through it, because every reconnect starts a session with a ledger of its own.
+	live atomic.Pointer[session]
 }
 
 func NewRunner(cfg config.Config, snk sink.Sink, log zerolog.Logger) *Runner {
-	return &Runner{cfg: cfg, sink: snk, log: log}
+	return (&Runner{cfg: cfg, sink: snk, log: log}).WithMetrics(metrics.New())
+}
+
+// WithMetrics replaces the private metrics a Runner starts with by the ones the process exposes.
+func (r *Runner) WithMetrics(m *metrics.Metrics) *Runner {
+	r.metrics = m
+	gauge := func(name string, read func(*session) float64) {
+		m.Gauge(name, func() float64 {
+			if s := r.live.Load(); s != nil {
+				return read(s)
+			}
+			return 0
+		})
+	}
+	gauge("walcast_streaming", func(*session) float64 { return 1 })
+	gauge("walcast_inflight_batches", func(s *session) float64 { return float64(s.ledger.Depth()) })
+	gauge("walcast_inflight_bytes", func(s *session) float64 { return float64(s.ledger.Bytes()) })
+	gauge("walcast_received_lsn", func(s *session) float64 { return float64(s.received.Load()) })
+	gauge("walcast_delivered_lsn", func(s *session) float64 { return float64(s.ledger.Delivered()) })
+	gauge("walcast_reported_lsn", func(s *session) float64 { return float64(s.ledger.Flushed()) })
+	return r
 }
 
 // Run streams one session until ctx is cancelled (nil error) or the session fails. It returns
@@ -98,7 +125,10 @@ func (r *Runner) Run(ctx context.Context) (pglogrepl.LSN, error) {
 		}
 		s.systemID, s.backfilling = systemID, true
 	}
+	s.metrics = r.metrics
 	r.lastDispatch = s.dispatched
+	r.live.Store(s)
+	defer r.live.Store(nil)
 	return s.run(ctx, r.sink)
 }
 
@@ -167,6 +197,12 @@ type session struct {
 	lingerAt      time.Time
 	nextFeedback  time.Time
 	lastServerMsg time.Time
+
+	// Cold fields stay last, behind everything the receive path touches per message. received feeds
+	// a gauge and is published per sealed batch and per keepalive, which is fresh enough for a scrape.
+	metrics  *metrics.Metrics
+	received atomic.Uint64
+	walStart pglogrepl.LSN
 }
 
 // chunkReads is a chunk being written into the stream at its marker's position. It spans several
@@ -207,6 +243,7 @@ func newSession(cfg config.Config, log zerolog.Logger, st stream) *session {
 		stream:        st,
 		ledger:        ledger.New(0),
 		enc:           enc,
+		metrics:       metrics.New(),
 		queue:         make(chan *event.Batch, queueCap),
 		dispatched:    make(chan struct{}),
 		cur:           event.NewBatch(),
@@ -269,16 +306,36 @@ func (s *session) dispatch(ctx context.Context, snk sink.Sink, stopLoop context.
 			continue
 		}
 		outstanding.Add(1)
+		sent := time.Now()
 		snk.Send(ctx, b, func(err error) {
 			defer outstanding.Done()
 			if err != nil {
+				s.metrics.DeliveryFailures.Inc()
 				s.ledger.Fail(fmt.Errorf("deliver batch: %w", err))
 				stopLoop()
 			} else {
+				s.observeDelivery(b, sent)
 				s.ledger.Done(b.Seq)
 			}
 			b.Release()
 		})
+	}
+}
+
+// observeDelivery runs on the sink's goroutine, once per batch and before the batch goes back to
+// the pool. Nothing here is on the path that decodes WAL.
+func (s *session) observeDelivery(b *event.Batch, sent time.Time) {
+	now := time.Now()
+	s.metrics.Delivery.Observe(now.Sub(sent))
+	if b.CommitNanos != 0 {
+		s.metrics.EndToEnd.Observe(time.Duration(now.UnixNano() - b.CommitNanos))
+	}
+	s.metrics.BatchesDelivered.Inc()
+	s.metrics.BytesDelivered.Add(len(b.Buf))
+	for _, rec := range b.Records {
+		if counter := s.metrics.EventsDelivered[rec.Op]; counter != nil {
+			counter.Inc()
+		}
 	}
 }
 
@@ -396,6 +453,7 @@ func (s *session) handleKeepalive(data []byte) error {
 	if !s.inTx && !s.cur.Dirty() {
 		s.ledger.AdvanceIdle(ka.ServerWALEnd)
 	}
+	s.received.Store(uint64(max(s.walStart, ka.ServerWALEnd)))
 	if ka.ReplyRequested {
 		s.nextFeedback = time.Time{}
 	}
@@ -411,6 +469,7 @@ func (s *session) handleXLogData(data []byte) error {
 	if err != nil {
 		return fmt.Errorf("parse pgoutput message: %w", err)
 	}
+	s.walStart = xld.WALStart
 
 	wasDirty := s.cur.Dirty()
 	recorded := len(s.cur.Records)
@@ -433,6 +492,9 @@ func (s *session) handleXLogData(data []byte) error {
 		err = s.enc.Truncate(s.cur, xld.WALStart, m)
 	case *pglogrepl.CommitMessage:
 		s.inTx = false
+		if s.cur.CommitNanos == 0 {
+			s.cur.CommitNanos = m.CommitTime.UnixNano()
+		}
 		if s.cur.Dirty() || !s.ledger.AdvanceIdle(m.TransactionEndLSN) {
 			s.cur.AckLSN = m.TransactionEndLSN
 		}
@@ -500,13 +562,17 @@ func (s *session) emitReads() error {
 		}
 		r.key = key
 		switch s.tracker.verdict(key, r.chunk.xmin) {
+		case rowDrop:
+			s.metrics.BackfillDropped.Inc()
 		case rowRetry:
+			s.metrics.BackfillRetried.Inc()
 			r.retry = append(r.retry, r.chunk.keys[r.next])
 		case rowEmit:
 			if err := s.enc.Read(s.cur, r.lsn, r.chunk.table, row, r.id, uint64(r.next), r.chunk.ts); err != nil {
 				return fmt.Errorf("encode backfill row: %w", err)
 			}
 			r.emitted++
+			s.metrics.BackfillRows.Inc()
 		}
 		r.next++
 	}
@@ -527,6 +593,7 @@ func (s *session) emitReads() error {
 		s.seal()
 	}
 	s.tracker.prune(r.chunk.xmin)
+	s.metrics.BackfillChunks.Inc()
 	s.awaited = &awaitedChunk{lsn: r.lsn, result: chunkResult{
 		generation: r.chunk.generation, number: r.chunk.number, emitted: r.emitted, retry: r.retry,
 		moves: s.takeKeyMoves(),
@@ -587,6 +654,7 @@ func (s *session) sealable() bool {
 }
 
 func (s *session) seal() {
+	s.received.Store(uint64(s.walStart))
 	s.cur.Seq = s.ledger.Add(s.cur.AckLSN, len(s.cur.Buf))
 	s.pending = s.cur
 	s.cur = event.NewBatch()

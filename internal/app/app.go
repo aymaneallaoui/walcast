@@ -11,25 +11,33 @@ import (
 	"github.com/aymaneallaoui/walcast/internal/backoff"
 	"github.com/aymaneallaoui/walcast/internal/config"
 	"github.com/aymaneallaoui/walcast/internal/event"
+	"github.com/aymaneallaoui/walcast/internal/metrics"
 	"github.com/aymaneallaoui/walcast/internal/replication"
 	"github.com/aymaneallaoui/walcast/internal/sink"
 )
 
 type App struct {
-	cfg  config.Config
-	log  zerolog.Logger
-	sink sink.Sink
+	cfg     config.Config
+	log     zerolog.Logger
+	sink    sink.Sink
+	metrics *metrics.Metrics
 }
 
 func New(cfg config.Config, log zerolog.Logger, snk sink.Sink) *App {
-	return &App{cfg: cfg, log: log, sink: snk}
+	return &App{cfg: cfg, log: log, sink: snk, metrics: metrics.New()}
+}
+
+// WithMetrics replaces the private metrics an App starts with by the ones the process exposes.
+func (a *App) WithMetrics(m *metrics.Metrics) *App {
+	a.metrics = m
+	return a
 }
 
 func (a *App) Run(ctx context.Context) error {
 	a.log.Info().Msg("walcast started")
 	defer a.log.Info().Msg("walcast stopped")
 
-	runner := replication.NewRunner(a.cfg, a.sink, a.log)
+	runner := replication.NewRunner(a.cfg, a.sink, a.log).WithMetrics(a.metrics)
 	var (
 		confirmed pglogrepl.LSN
 		attempt   int
@@ -54,6 +62,7 @@ func (a *App) Run(ctx context.Context) error {
 
 		delay := backoff.Delay(attempt, a.cfg.ReconnectMinDelay, a.cfg.ReconnectMaxDelay)
 		attempt++
+		a.metrics.Reconnects.Inc()
 		a.log.Warn().Err(err).Dur("retry_in", delay).Stringer("confirmed_lsn", confirmed).Msg("replication session ended")
 
 		timer := time.NewTimer(delay)

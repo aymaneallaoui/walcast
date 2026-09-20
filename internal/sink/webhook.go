@@ -44,6 +44,8 @@ type WebhookConfig struct {
 	RetryMin   time.Duration
 	RetryMax   time.Duration
 	HTTPClient *http.Client
+	// OnRetry is called before each wait that follows a failed attempt. It may be nil.
+	OnRetry func()
 }
 
 // Webhook delivers one batch at a time and retries in place, so a retried batch can never be
@@ -110,6 +112,9 @@ func (w *Webhook) Send(ctx context.Context, b *event.Batch, done func(error)) {
 
 		delay := max(backoff.Delay(attempt, w.cfg.RetryMin, w.cfg.RetryMax), retryAfter)
 		w.log.Warn().Err(err).Int("attempt", attempt+1).Dur("retry_in", delay).Msg("webhook delivery failed")
+		if w.cfg.OnRetry != nil {
+			w.cfg.OnRetry()
+		}
 
 		timer := time.NewTimer(delay)
 		select {
