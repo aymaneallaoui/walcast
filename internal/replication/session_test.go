@@ -312,14 +312,18 @@ func TestSession_run(t *testing.T) {
 		}
 	})
 
-	t.Run("sink failure ends the session without acking", func(t *testing.T) {
-		snk := &recordingSink{err: errors.New("disk full")}
+	t.Run("sink failure ends the session at once without acking", func(t *testing.T) {
+		cfg := testConfig()
+		cfg.FeedbackInterval = time.Hour
+		cfg.ServerTimeout = 2 * time.Hour
+		want := errors.New("disk full")
+		snk := &recordingSink{err: want}
 		st := newFakeStream(committedInsert()...)
-		_, result := startSession(t, testConfig(), st, snk)
+		_, result := startSession(t, cfg, st, snk)
 
 		lsn, err := result()
-		if err == nil || lsn != 0 {
-			t.Fatalf("lsn=%s err=%v, want an error and no ack", lsn, err)
+		if !errors.Is(err, want) || lsn != 0 {
+			t.Fatalf("lsn=%s err=%v, want the sink error and no ack", lsn, err)
 		}
 	})
 
