@@ -654,8 +654,14 @@ func (w *backfillWorker) selectChunk(ctx context.Context, table backfillTable, a
 	}
 	// A chunk cut short by the byte budget reads fewer rows next time instead of fetching and
 	// discarding the same tail again.
-	if truncated && len(only) == 0 {
+	// One wide row must not slow the rest of the table down for good: the limit shrinks when the
+	// budget cuts a chunk short and doubles back towards the configured size when it does not.
+	switch {
+	case len(only) > 0:
+	case truncated:
 		w.chunkRows = max(1, len(c.rows))
+	default:
+		w.chunkRows = min(w.cfg.BackfillChunkRows, w.chunkRows*2)
 	}
 	return c, truncated, nil
 }
