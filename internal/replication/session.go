@@ -86,6 +86,12 @@ func (r *Runner) awaitLastDispatcher(ctx context.Context) error {
 	select {
 	case <-r.lastDispatch:
 		return nil
+	default:
+		r.log.Warn().Msg("previous session still has deliveries in flight, reconnecting once they settle")
+	}
+	select {
+	case <-r.lastDispatch:
+		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
