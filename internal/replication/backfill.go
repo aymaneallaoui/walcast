@@ -132,6 +132,7 @@ type backfillWorker struct {
 	systemID   string
 	generation uint64
 	chunkRows  int
+	names      []string
 }
 
 func runBackfill(ctx context.Context, cfg config.Config, log zerolog.Logger, link *backfillLink, systemID string) error {
@@ -167,6 +168,7 @@ func (w *backfillWorker) run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	w.names = names
 
 	for _, name := range names {
 		table, err := w.describe(ctx, name)
@@ -669,6 +671,10 @@ func (w *backfillWorker) selectChunk(ctx context.Context, table backfillTable, a
 // park saves a key move on the progress row of a table that is waiting for its turn. A table with
 // no row has not started, and will meet the moved row in its own scan.
 func (w *backfillWorker) park(ctx context.Context, move keyMove) error {
+	// A table that is no longer configured never gets its turn, so its parked keys would only grow.
+	if !slices.Contains(w.names, move.table) {
+		return nil
+	}
 	schema, name, _ := strings.Cut(move.table, ".")
 	rows, err := w.query(ctx, `
 SELECT a.attname FROM pg_index i
