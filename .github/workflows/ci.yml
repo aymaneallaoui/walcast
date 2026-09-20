@@ -44,8 +44,6 @@ jobs:
   integration:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    env:
-      DATABASE_URL: postgres://walcast:walcast@localhost:5432/walcast?sslmode=disable
     steps:
       - uses: actions/checkout@v7
         with:
@@ -53,10 +51,7 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      - run: docker compose up -d --wait
       - run: go test -tags integration -race -shuffle=on -count=1 ./internal/replication/
-      - if: failure()
-        run: docker compose logs postgres
 
   vuln:
     runs-on: ubuntu-latest
