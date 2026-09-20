@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,8 +55,8 @@ type chunk struct {
 	generation uint64
 	number     uint64
 	tableName  string
+	tableOID   uint32
 	table      *event.Table
-	backfillID string
 	xmin       uint64
 	ts         []byte
 	rows       [][][]byte
@@ -68,7 +69,7 @@ type chunkResult struct {
 	number     uint64
 	emitted    int
 	retry      [][]string
-	orphans    [][]byte
+	moves      []keyMove
 	invalid    bool
 }
 
@@ -204,17 +205,28 @@ func (w *backfillWorker) checkSource(ctx context.Context) error {
 	return nil
 }
 
+// tableNames never returns walcast's own state tables: an all-tables publication contains them,
+// and the encoder's ignore list only covers the stream, not rows read by a backfill.
 func (w *backfillWorker) tableNames(ctx context.Context) ([]string, error) {
+	own := []string{w.cfg.StateSchema + "." + stateTable, w.cfg.StateSchema + "." + progressTable}
 	if len(w.cfg.BackfillTables) != 1 || w.cfg.BackfillTables[0] != config.BackfillAll {
-		return qualified(w.cfg.BackfillTables), nil
+		names := qualified(w.cfg.BackfillTables)
+		for _, name := range names {
+			if slices.Contains(own, name) {
+				return nil, fmt.Errorf("%w: %s is walcast's own state and is never emitted", ErrBackfillRefused, name)
+			}
+		}
+		return names, nil
 	}
 	rows, err := w.query(ctx, "SELECT schemaname || '.' || tablename FROM pg_publication_tables WHERE pubname = $1 ORDER BY 1", w.cfg.PublicationName)
 	if err != nil {
 		return nil, fmt.Errorf("list publication tables: %w", err)
 	}
-	names := make([]string, len(rows))
-	for i, row := range rows {
-		names[i] = string(row[0])
+	var names []string
+	for _, row := range rows {
+		if name := string(row[0]); !slices.Contains(own, name) {
+			names = append(names, name)
+		}
 	}
 	return names, nil
 }
@@ -333,6 +345,21 @@ func (w *backfillWorker) backfill(ctx context.Context, table backfillTable, prog
 	if err != nil {
 		return err
 	}
+	// Key moves that arrived while another table was being copied were parked on this table's
+	// progress row. They are behind the saved cursor or above the upper bound, so they go first.
+	if len(progress.pending) > 0 {
+		emitted, fresh, err := w.deliver(ctx, table, &chunk{generation: w.generation, tableName: table.qualified(), tableOID: table.oid, table: table.desc}, fence, progress.pending)
+		if err != nil {
+			return err
+		}
+		if fresh != 0 {
+			return fmt.Errorf("key tracker was reset while reading parked keys of %s", table.qualified())
+		}
+		progress.rows += int64(emitted)
+		if err := clearPendingKeys(ctx, w.conn, w.cfg.StateSchema, table); err != nil {
+			return err
+		}
+	}
 	for number := uint64(1); ; number++ {
 		c, _, err := w.readChunk(ctx, table, number, fence, progress.last, progress.upper, nil)
 		if err != nil {
@@ -342,7 +369,7 @@ func (w *backfillWorker) backfill(ctx context.Context, table backfillTable, prog
 		// The empty chunk at the end of the scan still goes through the stream: it collects the
 		// key moves seen since the last chunk, which the scan itself will never come back to.
 		finished := len(c.rows) == 0
-		emitted, fresh, err := w.deliver(ctx, table, c, fence)
+		emitted, fresh, err := w.deliver(ctx, table, c, fence, nil)
 		if err != nil {
 			return err
 		}
@@ -368,9 +395,8 @@ func (w *backfillWorker) backfill(ctx context.Context, table backfillTable, prog
 // the stream only patched, and key moves. It returns once each of them has been emitted, superseded
 // by a complete stream image, or deleted. A non-zero fence means the tracker was reset and the
 // whole chunk must be read again.
-func (w *backfillWorker) deliver(ctx context.Context, table backfillTable, c *chunk, fence uint64) (emitted int, fresh uint64, err error) {
+func (w *backfillWorker) deliver(ctx context.Context, table backfillTable, c *chunk, fence uint64, queue [][]string) (emitted int, fresh uint64, err error) {
 	var (
-		queue  [][]string
 		batch  = w.cfg.BackfillChunkRows
 		number = c.number
 	)
@@ -390,8 +416,16 @@ func (w *backfillWorker) deliver(ctx context.Context, table backfillTable, c *ch
 		}
 		emitted += result.emitted
 		queue = append(queue, result.retry...)
-		for _, orphan := range result.orphans {
-			key, err := keyValues(table, orphan)
+		for _, move := range result.moves {
+			if move.table != table.qualified() {
+				// Another table's move cannot be read now, its keys are not being tracked. Parking
+				// it durably lets the ack move on instead of holding WAL until that table's turn.
+				if err := w.park(ctx, move); err != nil {
+					return 0, 0, err
+				}
+				continue
+			}
+			key, err := keyValues(table.keyColumns, table.qualified(), move.key)
 			if err != nil {
 				return 0, 0, err
 			}
@@ -522,10 +556,6 @@ func (w *backfillWorker) readChunk(ctx context.Context, table backfillTable, num
 				return nil, false, err
 			}
 			c.generation, c.number, c.xmin = w.generation, number, xmin
-			c.backfillID = fmt.Sprintf("%d.%d.%d", table.oid, w.generation, number)
-			if len(only) > 0 {
-				c.backfillID += ".r"
-			}
 			return c, truncated, nil
 		}
 		if rollbackErr := w.exec(ctx, "ROLLBACK"); err == nil {
@@ -596,7 +626,7 @@ func (w *backfillWorker) selectChunk(ctx context.Context, table backfillTable, a
 		params[i] = []byte(a)
 	}
 	reader := w.conn.ExecParams(ctx, sql, params, nil, nil, nil)
-	c := &chunk{tableName: table.qualified(), table: table.desc, ts: time.Now().UTC().AppendFormat(nil, time.RFC3339Nano)}
+	c := &chunk{tableName: table.qualified(), tableOID: table.oid, table: table.desc, ts: time.Now().UTC().AppendFormat(nil, time.RFC3339Nano)}
 	var (
 		size      int
 		truncated bool
@@ -630,16 +660,44 @@ func (w *backfillWorker) selectChunk(ctx context.Context, table backfillTable, a
 	return c, truncated, nil
 }
 
+// park saves a key move on the progress row of a table that is waiting for its turn. A table with
+// no row has not started, and will meet the moved row in its own scan.
+func (w *backfillWorker) park(ctx context.Context, move keyMove) error {
+	schema, name, _ := strings.Cut(move.table, ".")
+	rows, err := w.query(ctx, `
+SELECT a.attname FROM pg_index i
+CROSS JOIN LATERAL unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
+JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+JOIN pg_class c ON c.oid = i.indrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = $1 AND c.relname = $2 AND i.indisprimary ORDER BY k.ord`, schema, name)
+	if err != nil {
+		return fmt.Errorf("park key move of %s: %w", move.table, err)
+	}
+	key, err := keyValues(toStrings(flatten(rows)), move.table, move.key)
+	if err != nil {
+		return err
+	}
+	return parkPendingKey(ctx, w.conn, w.cfg.StateSchema, move.table, key)
+}
+
+func flatten(rows [][][]byte) [][]byte {
+	out := make([][]byte, len(rows))
+	for i, row := range rows {
+		out[i] = row[0]
+	}
+	return out
+}
+
 // keyValues turns a key as the encoder renders it back into the text values a query needs.
-func keyValues(table backfillTable, encoded []byte) ([]string, error) {
+func keyValues(keyColumns []string, table string, encoded []byte) ([]string, error) {
 	var fields map[string]any
 	dec := json.NewDecoder(bytes.NewReader(encoded))
 	dec.UseNumber()
 	if err := dec.Decode(&fields); err != nil {
-		return nil, fmt.Errorf("decode key %s of %s: %w", encoded, table.qualified(), err)
+		return nil, fmt.Errorf("decode key %s of %s: %w", encoded, table, err)
 	}
-	values := make([]string, len(table.keyColumns))
-	for i, column := range table.keyColumns {
+	values := make([]string, len(keyColumns))
+	for i, column := range keyColumns {
 		switch v := fields[column].(type) {
 		case string:
 			values[i] = v
@@ -648,7 +706,7 @@ func keyValues(table backfillTable, encoded []byte) ([]string, error) {
 		case bool:
 			values[i] = strconv.FormatBool(v)
 		default:
-			return nil, fmt.Errorf("decode key %s of %s: column %s has no usable value", encoded, table.qualified(), column)
+			return nil, fmt.Errorf("decode key %s of %s: column %s has no usable value", encoded, table, column)
 		}
 	}
 	return values, nil
