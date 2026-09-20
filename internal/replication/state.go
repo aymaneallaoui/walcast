@@ -11,7 +11,8 @@ import (
 )
 
 const (
-	stateTable = "slots"
+	stateTable    = "slots"
+	progressTable = "backfills"
 
 	// Class 42 is "syntax error or access rule violation": missing privilege, wrong column, reserved
 	// name. The same statement fails the same way on every reconnect.

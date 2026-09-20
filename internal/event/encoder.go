@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"time"
 
@@ -15,6 +16,7 @@ const (
 	OpUpdate   = "update"
 	OpDelete   = "delete"
 	OpTruncate = "truncate"
+	OpRead     = "read"
 
 	columnFlagKey       = 1
 	replicaIdentityFull = 'f'
@@ -50,7 +52,7 @@ type Encoder struct {
 	op        string
 
 	ignoreSchema string
-	ignoreName   string
+	ignoreNames  []string
 	ignored      map[uint32]struct{}
 }
 
@@ -58,16 +60,16 @@ func NewEncoder() *Encoder {
 	return &Encoder{rels: make(map[uint32]*relation)}
 }
 
-// IgnoreTable drops every change to one table: walcast's own state table, which an all-tables
-// publication would otherwise stream. It is never a whole schema, so no user table can vanish.
-func (e *Encoder) IgnoreTable(schema, name string) {
-	e.ignoreSchema, e.ignoreName = schema, name
+// IgnoreTables drops every change to the named tables: walcast's own state tables, which an
+// all-tables publication would otherwise stream. It is never a whole schema, so no user table can vanish.
+func (e *Encoder) IgnoreTables(schema string, names ...string) {
+	e.ignoreSchema, e.ignoreNames = schema, names
 }
 
 // Relation keeps ignored tables out of rels, so the per-event lookup costs what it did before
 // IgnoreTable existed and the ignore check runs only when that lookup misses.
 func (e *Encoder) Relation(m *pglogrepl.RelationMessage) {
-	if e.ignoreName != "" && m.Namespace == e.ignoreSchema && m.RelationName == e.ignoreName {
+	if m.Namespace == e.ignoreSchema && slices.Contains(e.ignoreNames, m.RelationName) {
 		if e.ignored == nil {
 			e.ignored = make(map[uint32]struct{})
 		}
@@ -77,26 +79,127 @@ func (e *Encoder) Relation(m *pglogrepl.RelationMessage) {
 	}
 	delete(e.ignored, m.RelationID)
 
-	name := m.Namespace + "." + m.RelationName
-	rel := &relation{
-		schema:  m.Namespace,
-		relname: m.RelationName,
-		name:    name,
-		table:   appendString(nil, []byte(name)),
-		cols:    make([]column, len(m.Columns)),
-	}
+	cols := make([]Column, len(m.Columns))
 	for i, c := range m.Columns {
-		name := appendString(nil, []byte(c.Name))
-		rel.cols[i] = column{
-			key:   append(append([]byte{}, name...), ':'),
-			name:  name,
-			oid:   c.DataType,
-			isKey: c.Flags&columnFlagKey != 0,
-		}
-		rel.keyed = rel.keyed || rel.cols[i].isKey
+		cols[i] = Column{Name: c.Name, OID: c.DataType, Key: c.Flags&columnFlagKey != 0}
 	}
+	rel := newRelation(m.Namespace, m.RelationName, cols)
 	rel.keyed = rel.keyed && m.ReplicaIdentity != replicaIdentityFull
 	e.rels[m.RelationID] = rel
+}
+
+func newRelation(schema, relname string, cols []Column) *relation {
+	name := schema + "." + relname
+	rel := &relation{
+		schema:  schema,
+		relname: relname,
+		name:    name,
+		table:   appendString(nil, []byte(name)),
+		cols:    make([]column, len(cols)),
+	}
+	for i, c := range cols {
+		quoted := appendString(nil, []byte(c.Name))
+		rel.cols[i] = column{
+			key:   append(append([]byte{}, quoted...), ':'),
+			name:  quoted,
+			oid:   c.OID,
+			isKey: c.Key,
+		}
+		rel.keyed = rel.keyed || c.Key
+	}
+	return rel
+}
+
+// Column and Table describe a relation taken from the catalog instead of a Relation message, so a
+// backfilled row never depends on, or disturbs, what the stream last said about the table.
+type Column struct {
+	Name string
+	OID  uint32
+	Key  bool
+}
+
+type Table struct{ rel *relation }
+
+func NewTable(schema, name string, cols []Column) *Table {
+	return &Table{rel: newRelation(schema, name, cols)}
+}
+
+// AppendKey renders a row's key exactly as the stream does, so the two can be compared.
+func (t *Table) AppendKey(dst []byte, row [][]byte) ([]byte, error) {
+	rel := t.rel
+	if len(row) != len(rel.cols) {
+		return nil, fmt.Errorf("%w: row has %d columns, table has %d", ErrUnencodable, len(row), len(rel.cols))
+	}
+	dst = append(dst, '{')
+	first := true
+	for i, v := range row {
+		col := &rel.cols[i]
+		if !col.isKey {
+			continue
+		}
+		if v == nil {
+			return nil, fmt.Errorf("%w: key column %s of %s is null", ErrUnencodable, col.name, rel.name)
+		}
+		if !first {
+			dst = append(dst, ',')
+		}
+		first = false
+		dst = append(dst, col.key...)
+		dst = appendValue(dst, col.oid, v)
+	}
+	return append(dst, '}'), nil
+}
+
+// Read encodes one backfilled row; a nil value is NULL. It carries a backfill id instead of a
+// commit LSN: a marker's LSN can equal the commit LSN of the next transaction, so sharing the
+// (commit_lsn, seq) namespace would let a consumer dedupe a real change away.
+func (e *Encoder) Read(b *Batch, lsn pglogrepl.LSN, t *Table, row [][]byte, backfill string, seq uint64, ts []byte) error {
+	rel := t.rel
+	if len(row) != len(rel.cols) {
+		return fmt.Errorf("%w: row has %d columns, table has %d", ErrUnencodable, len(row), len(rel.cols))
+	}
+	start := len(b.Buf)
+	buf := b.Buf
+	buf = append(buf, "{\"table\":"...)
+	buf = append(buf, rel.table...)
+	buf = append(buf, ",\"op\":\"read\",\"lsn\":\""...)
+	buf = appendLSN(buf, lsn)
+	buf = append(buf, "\",\"backfill\":"...)
+	buf = appendString(buf, []byte(backfill))
+	buf = append(buf, ",\"seq\":"...)
+	buf = strconv.AppendUint(buf, seq, 10)
+	buf = append(buf, ",\"ts\":\""...)
+	buf = append(buf, ts...)
+	buf = append(buf, "\",\"new\":{"...)
+	for i, v := range row {
+		if i > 0 {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, rel.cols[i].key...)
+		if v == nil {
+			buf = append(buf, "null"...)
+		} else {
+			buf = appendValue(buf, rel.cols[i].oid, v)
+		}
+	}
+	keyStart := len(b.Keys)
+	keys, err := t.AppendKey(b.Keys, row)
+	if err != nil {
+		return err
+	}
+	buf = append(buf, "}}"...)
+	b.Keys = keys
+	b.Records = append(b.Records, Record{
+		Op:     OpRead,
+		Schema: rel.schema, Name: rel.relname,
+		Table:      rel.name,
+		valueStart: start, valueEnd: len(buf),
+		keyStart: keyStart, keyEnd: len(b.Keys),
+	})
+	buf = append(buf, '\n')
+	b.Buf = buf
+	b.Events++
+	return nil
 }
 
 func (e *Encoder) Begin(m *pglogrepl.BeginMessage) {
@@ -267,6 +370,7 @@ func (e *Encoder) footer(b *Batch, rel *relation, identity, previous *pglogrepl.
 		Op:     e.op,
 		Schema: rel.schema, Name: rel.relname,
 		Table:      rel.name,
+		Partial:    len(e.unchanged) > 0,
 		valueStart: e.recStart, valueEnd: len(buf),
 		keyStart: keyStart, keyEnd: len(b.Keys),
 	})
