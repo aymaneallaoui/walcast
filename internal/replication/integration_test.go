@@ -8,8 +8,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,6 +27,7 @@ import (
 	"github.com/aymaneallaoui/walcast/internal/config"
 	"github.com/aymaneallaoui/walcast/internal/event"
 	"github.com/aymaneallaoui/walcast/internal/replication"
+	"github.com/aymaneallaoui/walcast/internal/sink"
 )
 
 const waitTimeout = 30 * time.Second
@@ -415,5 +421,86 @@ func TestSupervisorStopsWhenSlotDisappears(t *testing.T) {
 		}
 	case <-time.After(waitTimeout):
 		t.Fatal("supervisor kept running after its slot was dropped")
+	}
+}
+
+func TestWebhookSinkSurvivesReceiverOutageWithoutLossOrEarlyAck(t *testing.T) {
+	const secret = "integration-test-secret"
+	var (
+		mu      sync.Mutex
+		healthy bool
+		lines   []string
+		badSig  int
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		defer mu.Unlock()
+		if !healthy {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		header := r.Header.Get(sink.HeaderSignature)
+		ts, _, _ := strings.Cut(strings.TrimPrefix(header, "t="), ",")
+		unix, _ := strconv.ParseInt(ts, 10, 64)
+		if sink.Sign([]byte(secret), time.Unix(unix, 0), body) != header {
+			badSig++
+		}
+		lines = append(lines, strings.Split(strings.TrimSpace(string(body)), "\n")...)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(srv.Close)
+
+	h := newHarness(t, nil)
+	wh := sink.NewWebhook(sink.WebhookConfig{
+		URL: srv.URL, Secret: secret, Timeout: 2 * time.Second,
+		RetryMin: 20 * time.Millisecond, RetryMax: 100 * time.Millisecond,
+	}, zerolog.Nop())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	finished := make(chan error, 1)
+	go func() {
+		_, err := replication.NewRunner(h.cfg, wh, zerolog.Nop()).Run(ctx)
+		finished <- err
+	}()
+	t.Cleanup(cancel)
+	h.waitFor("slot to become active", h.slotActive)
+
+	before := h.confirmedLSN()
+	h.exec(fmt.Sprintf("INSERT INTO %s VALUES (1, 'during outage', true)", h.table))
+	time.Sleep(time.Second)
+	if got := h.confirmedLSN(); got != before {
+		t.Fatalf("confirmed_flush_lsn moved from %s to %s while the receiver was rejecting every request", before, got)
+	}
+
+	mu.Lock()
+	healthy = true
+	mu.Unlock()
+	h.exec(fmt.Sprintf("INSERT INTO %s VALUES (2, 'after recovery', true)", h.table))
+
+	h.waitFor("both events at the receiver", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(lines) >= 2
+	})
+	h.waitFor("ack after delivery", func() bool { return h.confirmedLSN() > before })
+
+	cancel()
+	select {
+	case err := <-finished:
+		if err != nil {
+			t.Fatalf("Run returned error on shutdown: %v", err)
+		}
+	case <-time.After(waitTimeout):
+		t.Fatal("Run did not stop after cancel")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if badSig != 0 {
+		t.Fatalf("%d requests failed signature verification", badSig)
+	}
+	if len(lines) != 2 || !strings.Contains(lines[0], "during outage") || !strings.Contains(lines[1], "after recovery") {
+		t.Fatalf("receiver got %q, want the two rows in commit order", lines)
 	}
 }
