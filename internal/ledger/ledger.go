@@ -26,6 +26,7 @@ type Ledger struct {
 	err     error
 
 	flushed atomic.Uint64
+	hold    atomic.Uint64
 	bytes   atomic.Int64
 	notify  chan struct{}
 }
@@ -99,8 +100,37 @@ func (l *Ledger) AdvanceIdle(lsn pglogrepl.LSN) bool {
 	return true
 }
 
+// Flushed is what may be reported to Postgres: everything delivered, capped by a hold.
 func (l *Ledger) Flushed() pglogrepl.LSN {
+	flushed, hold := l.flushed.Load(), l.hold.Load()
+	if hold != 0 && hold < flushed {
+		return pglogrepl.LSN(hold)
+	}
+	return pglogrepl.LSN(flushed)
+}
+
+// Delivered ignores the hold. Work that waits for a delivery must use it, or a hold would stall
+// the very delivery that lifts it.
+func (l *Ledger) Delivered() pglogrepl.LSN {
 	return pglogrepl.LSN(l.flushed.Load())
+}
+
+// Hold keeps Flushed at or below lsn although later batches are delivered, so a restart replays
+// from there. It only ever moves down until Release: the earliest unresolved position wins.
+func (l *Ledger) Hold(lsn pglogrepl.LSN) {
+	for {
+		cur := l.hold.Load()
+		if cur != 0 && cur <= uint64(lsn) {
+			return
+		}
+		if l.hold.CompareAndSwap(cur, uint64(lsn)) {
+			return
+		}
+	}
+}
+
+func (l *Ledger) Release() {
+	l.hold.Store(0)
 }
 
 // Depth counts batches not yet retired, including completed ones stuck behind an unfinished
