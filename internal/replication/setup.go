@@ -104,6 +104,33 @@ func qualified(tables []string) []string {
 	return out
 }
 
+type slotAction int
+
+const (
+	slotKeep slotAction = iota
+	slotAdopt
+	slotCreate
+	slotRecreate
+	slotRefuse
+)
+
+// decideSlot is the whole policy for a process start. A slot that the state table remembers but
+// Postgres no longer has is recreated only when the operator names the next generation exactly.
+func decideSlot(exists bool, state slotState, requested int) slotAction {
+	switch {
+	case exists && state.known:
+		return slotKeep
+	case exists:
+		return slotAdopt
+	case !state.known:
+		return slotCreate
+	case requested == state.generation+1:
+		return slotRecreate
+	default:
+		return slotRefuse
+	}
+}
+
 // bootstrapSlot runs once per process. The state table outlives the slot, so a slot that vanished
 // while walcast was down is refused instead of being recreated past every change made since.
 func bootstrapSlot(ctx context.Context, conn *pgconn.PgConn, log zerolog.Logger, cfg config.Config) error {
@@ -119,32 +146,42 @@ func bootstrapSlot(ctx context.Context, conn *pgconn.PgConn, log zerolog.Logger,
 		return err
 	}
 
-	switch {
-	case exists:
-	case !state.known:
-		if err := createSlot(ctx, conn, log, cfg.SlotName); err != nil {
-			return err
+	switch decideSlot(exists, state, cfg.SlotRecreateGeneration) {
+	case slotKeep:
+	case slotAdopt:
+		err = recordSlot(ctx, conn, cfg.StateSchema, cfg.SlotName)
+	case slotCreate:
+		// Slot first: a crash before the row is written leaves a slot to adopt, never a false loss.
+		if err = createSlot(ctx, conn, log, cfg.SlotName); err == nil {
+			err = recordSlot(ctx, conn, cfg.StateSchema, cfg.SlotName)
 		}
-	case cfg.SlotRecreateGeneration != state.generation+1:
-		return fmt.Errorf("%w: %w: %s is gone and the changes made since are not recoverable; set SLOT_RECREATE_GENERATION=%d to accept the gap and recreate it",
-			ErrSlotUnusable, ErrSlotLost, cfg.SlotName, state.generation+1)
-	default:
-		// The generation is bumped before the slot exists: a crash in between then refuses the
-		// same flag value, where the other order would let it recreate the slot a second time.
-		if err := recordRecreation(ctx, conn, cfg.StateSchema, cfg.SlotName, cfg.SlotRecreateGeneration); err != nil {
-			return err
+	case slotRecreate:
+		// Generation first: a crash before the slot exists then refuses this same value, where the
+		// other order would let it recreate the slot a second time.
+		if err = spendGeneration(ctx, conn, cfg.StateSchema, cfg.SlotName, cfg.SlotRecreateGeneration, true); err == nil {
+			err = createSlot(ctx, conn, log, cfg.SlotName)
 		}
-		if err := createSlot(ctx, conn, log, cfg.SlotName); err != nil {
-			return err
+		if err == nil {
+			log.Warn().Str("slot", cfg.SlotName).Int("generation", cfg.SlotRecreateGeneration).
+				Msg("lost replication slot recreated on request, changes made while it was gone are skipped")
 		}
-		log.Error().Str("slot", cfg.SlotName).Int("generation", cfg.SlotRecreateGeneration).
-			Msg("lost replication slot recreated on request, changes made while it was gone are skipped")
+		return err
+	case slotRefuse:
+		return fmt.Errorf("%w: %s is gone and the changes made since are not recoverable; set SLOT_RECREATE_GENERATION=%d to accept the gap and recreate it",
+			ErrSlotLost, cfg.SlotName, state.generation+1)
+	}
+	if err != nil {
+		return err
 	}
 
-	if state.known {
-		return nil
+	// An override that found nothing to recreate is spent anyway, or it would stay armed and let a
+	// later loss through without anyone deciding to accept it.
+	if cfg.SlotRecreateGeneration == state.generation+1 {
+		log.Warn().Str("slot", cfg.SlotName).Int("generation", cfg.SlotRecreateGeneration).
+			Msg("SLOT_RECREATE_GENERATION is set but the slot was not lost, the value is now used up")
+		return spendGeneration(ctx, conn, cfg.StateSchema, cfg.SlotName, cfg.SlotRecreateGeneration, false)
 	}
-	return recordSlot(ctx, conn, cfg.StateSchema, cfg.SlotName, cfg.PublicationName)
+	return nil
 }
 
 // requireSlot guards reconnects: a slot that vanishes between sessions is never recreated.
