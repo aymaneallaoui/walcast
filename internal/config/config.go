@@ -97,6 +97,12 @@ func Load() (Config, error) {
 	return cfg, nil
 }
 
+// reservedSchema keeps walcast's table out of schemas it does not own: Postgres reserves pg_, and
+// a "slots" table in public could collide with a user table of the same name.
+func reservedSchema(name string) bool {
+	return name == "public" || name == "information_schema" || strings.HasPrefix(name, "pg_")
+}
+
 // Validate restricts identifiers to a safe charset because replication connections
 // cannot use query parameters, so these names are interpolated into SQL.
 func (c Config) Validate() error {
@@ -111,8 +117,8 @@ func (c Config) Validate() error {
 			return fmt.Errorf("invalid table %q in PUBLICATION_TABLES", t)
 		}
 	}
-	if !nameRE.MatchString(c.StateSchema) {
-		return fmt.Errorf("invalid STATE_SCHEMA %q", c.StateSchema)
+	if !nameRE.MatchString(c.StateSchema) || reservedSchema(c.StateSchema) {
+		return fmt.Errorf("invalid STATE_SCHEMA %q: it must be a schema of its own, not public or a system schema", c.StateSchema)
 	}
 	if c.SlotRecreateGeneration < 0 {
 		return errors.New("SLOT_RECREATE_GENERATION must not be negative")

@@ -44,6 +44,11 @@ func TestValidateRejectsUnsafeIdentifiersAndBadBounds(t *testing.T) {
 		"overlong table name":     func(c *Config) { c.PublicationTables = []string{strings.Repeat("a", 64)} },
 		"min delay above max":     func(c *Config) { c.ReconnectMinDelay = time.Minute },
 		"non positive batch size": func(c *Config) { c.BatchMaxBytes = 0 },
+		"state schema with quote": func(c *Config) { c.StateSchema = "x'; DROP SCHEMA public; --" },
+		"state schema public":     func(c *Config) { c.StateSchema = "public" },
+		"state schema pg prefix":  func(c *Config) { c.StateSchema = "pg_walcast" },
+		"state schema catalog":    func(c *Config) { c.StateSchema = "information_schema" },
+		"negative generation":     func(c *Config) { c.SlotRecreateGeneration = -1 },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
