@@ -2,6 +2,7 @@ package ledger
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pglogrepl"
@@ -86,14 +87,18 @@ func TestSequencesSurviveCompaction(t *testing.T) {
 	}
 }
 
-func TestFailIsStickyAndSignals(t *testing.T) {
+func TestFailKeepsEveryDistinctErrorAndSignals(t *testing.T) {
 	l := New(0)
-	first := errors.New("first")
+	first, second := errors.New("first"), errors.New("second")
 	l.Fail(first)
-	l.Fail(errors.New("second"))
+	l.Fail(second)
+	l.Fail(first)
 
-	if !errors.Is(l.Err(), first) {
-		t.Fatalf("err = %v, want first", l.Err())
+	if err := l.Err(); !errors.Is(err, first) || !errors.Is(err, second) {
+		t.Fatalf("err = %v, want both failures", err)
+	}
+	if got := strings.Count(l.Err().Error(), "first"); got != 1 {
+		t.Fatalf("first recorded %d times", got)
 	}
 	select {
 	case <-l.Notify():
