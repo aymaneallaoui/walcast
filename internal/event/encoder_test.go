@@ -186,6 +186,49 @@ func TestRecordsCarryValueKeyAndTable(t *testing.T) {
 	}
 }
 
+func TestUpdateRebuildsToastedKeyFromOldTuple(t *testing.T) {
+	e := newTestEncoder()
+	b := &Batch{}
+	err := e.Update(b, 1, &pglogrepl.UpdateMessage{
+		RelationID:   usersRelID,
+		OldTupleType: pglogrepl.UpdateMessageTupleTypeKey,
+		OldTuple:     tuple(text("7"), null(), null(), null(), null(), null()),
+		NewTuple:     tuple(toast(), text("new"), text("t"), text("1"), null(), null()),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(b.Key(b.Records[0])); got != `{"id":7}` {
+		t.Fatalf("key = %s, want the identity from the old tuple", got)
+	}
+}
+
+func TestKeyIsNeverInvented(t *testing.T) {
+	e := newTestEncoder()
+	err := e.Update(&Batch{}, 1, &pglogrepl.UpdateMessage{
+		RelationID: usersRelID,
+		NewTuple:   tuple(toast(), text("new"), text("t"), text("1"), null(), null()),
+	})
+	if !errors.Is(err, ErrUnencodable) {
+		t.Fatalf("err = %v, want ErrUnencodable", err)
+	}
+}
+
+func TestRecordsSplitSchemaFromName(t *testing.T) {
+	e := NewEncoder()
+	rel := usersRelation()
+	rel.Namespace, rel.RelationName = "a.b", "c"
+	e.Relation(rel)
+	e.Begin(&pglogrepl.BeginMessage{FinalLSN: 1, Xid: 1})
+	b := &Batch{}
+	if err := e.Insert(b, 1, &pglogrepl.InsertMessage{RelationID: usersRelID, Tuple: tuple(text("7"), text("a"), text("t"), text("1"), null(), null())}); err != nil {
+		t.Fatal(err)
+	}
+	if r := b.Records[0]; r.Schema != "a.b" || r.Name != "c" || r.Table != "a.b.c" {
+		t.Fatalf("record = %+v", r)
+	}
+}
+
 func TestReplicaIdentityFullHasNoStableKey(t *testing.T) {
 	e := NewEncoder()
 	rel := usersRelation()
