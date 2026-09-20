@@ -31,24 +31,47 @@ func TestValidateAcceptsDefaultsShape(t *testing.T) {
 	}
 }
 
+func TestValidateAcceptsBackfillSelections(t *testing.T) {
+	for name, tables := range map[string][]string{
+		"off":       nil,
+		"all":       {"all"},
+		"qualified": {"public.users", "orders"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := validConfig()
+			cfg.BackfillTables, cfg.BackfillChunkRows, cfg.BackfillChunkBytes = tables, 100, 1<<20
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
 func TestValidateRejectsUnsafeIdentifiersAndBadBounds(t *testing.T) {
 	cases := map[string]func(*Config){
-		"slot with quote":         func(c *Config) { c.SlotName = "x'; DROP TABLE users; --" },
-		"uppercase slot":          func(c *Config) { c.SlotName = "Walcast" },
-		"publication with space":  func(c *Config) { c.PublicationName = "my pub" },
-		"table with injection":    func(c *Config) { c.PublicationTables = []string{"users; DROP TABLE users"} },
-		"table with three parts":  func(c *Config) { c.PublicationTables = []string{"a.b.c"} },
-		"zero shutdown timeout":   func(c *Config) { c.ShutdownTimeout = 0 },
-		"zero feedback interval":  func(c *Config) { c.FeedbackInterval = 0 },
-		"server timeout too low":  func(c *Config) { c.ServerTimeout = c.FeedbackInterval },
-		"overlong table name":     func(c *Config) { c.PublicationTables = []string{strings.Repeat("a", 64)} },
-		"min delay above max":     func(c *Config) { c.ReconnectMinDelay = time.Minute },
-		"non positive batch size": func(c *Config) { c.BatchMaxBytes = 0 },
-		"state schema with quote": func(c *Config) { c.StateSchema = "x'; DROP SCHEMA public; --" },
-		"state schema public":     func(c *Config) { c.StateSchema = "public" },
-		"state schema pg prefix":  func(c *Config) { c.StateSchema = "pg_walcast" },
-		"state schema catalog":    func(c *Config) { c.StateSchema = "information_schema" },
-		"negative generation":     func(c *Config) { c.SlotRecreateGeneration = -1 },
+		"slot with quote":          func(c *Config) { c.SlotName = "x'; DROP TABLE users; --" },
+		"uppercase slot":           func(c *Config) { c.SlotName = "Walcast" },
+		"publication with space":   func(c *Config) { c.PublicationName = "my pub" },
+		"table with injection":     func(c *Config) { c.PublicationTables = []string{"users; DROP TABLE users"} },
+		"table with three parts":   func(c *Config) { c.PublicationTables = []string{"a.b.c"} },
+		"zero shutdown timeout":    func(c *Config) { c.ShutdownTimeout = 0 },
+		"zero feedback interval":   func(c *Config) { c.FeedbackInterval = 0 },
+		"server timeout too low":   func(c *Config) { c.ServerTimeout = c.FeedbackInterval },
+		"overlong table name":      func(c *Config) { c.PublicationTables = []string{strings.Repeat("a", 64)} },
+		"min delay above max":      func(c *Config) { c.ReconnectMinDelay = time.Minute },
+		"non positive batch size":  func(c *Config) { c.BatchMaxBytes = 0 },
+		"state schema with quote":  func(c *Config) { c.StateSchema = "x'; DROP SCHEMA public; --" },
+		"state schema public":      func(c *Config) { c.StateSchema = "public" },
+		"state schema pg prefix":   func(c *Config) { c.StateSchema = "pg_walcast" },
+		"state schema catalog":     func(c *Config) { c.StateSchema = "information_schema" },
+		"negative generation":      func(c *Config) { c.SlotRecreateGeneration = -1 },
+		"backfill table injection": func(c *Config) { c.BackfillTables = []string{"users; DROP TABLE users"} },
+		"backfill all mixed in": func(c *Config) {
+			c.BackfillTables = []string{"all", "public.users"}
+			c.BackfillChunkRows = 1
+			c.BackfillChunkBytes = 1
+		},
+		"backfill zero chunk rows": func(c *Config) { c.BackfillTables = []string{"users"}; c.BackfillChunkBytes = 1 },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
