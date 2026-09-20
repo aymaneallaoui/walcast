@@ -4,12 +4,21 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/caarlos0/env/v11"
 	"github.com/joho/godotenv"
+)
+
+const (
+	SinkStdout  = "stdout"
+	SinkWebhook = "webhook"
+
+	minWebhookSecretLen = 16
 )
 
 var (
@@ -35,6 +44,13 @@ type Config struct {
 
 	ReconnectMinDelay time.Duration `env:"RECONNECT_MIN_DELAY" envDefault:"500ms"`
 	ReconnectMaxDelay time.Duration `env:"RECONNECT_MAX_DELAY" envDefault:"30s"`
+
+	Sink            string        `env:"SINK" envDefault:"stdout"`
+	WebhookURL      string        `env:"WEBHOOK_URL"`
+	WebhookSecret   string        `env:"WEBHOOK_SECRET"`
+	WebhookTimeout  time.Duration `env:"WEBHOOK_TIMEOUT" envDefault:"10s"`
+	WebhookRetryMin time.Duration `env:"WEBHOOK_RETRY_MIN" envDefault:"500ms"`
+	WebhookRetryMax time.Duration `env:"WEBHOOK_RETRY_MAX" envDefault:"30s"`
 }
 
 func Load() (Config, error) {
@@ -81,5 +97,41 @@ func (c Config) Validate() error {
 	if c.ReconnectMinDelay <= 0 || c.ReconnectMaxDelay < c.ReconnectMinDelay {
 		return errors.New("RECONNECT_MIN_DELAY must be positive and not above RECONNECT_MAX_DELAY")
 	}
+	return c.validateSink()
+}
+
+func (c Config) validateSink() error {
+	switch c.Sink {
+	case "", SinkStdout:
+		return nil
+	case SinkWebhook:
+	default:
+		return fmt.Errorf("invalid SINK %q (want %s or %s)", c.Sink, SinkStdout, SinkWebhook)
+	}
+
+	u, err := url.Parse(c.WebhookURL)
+	if err != nil || u.Host == "" {
+		return errors.New("WEBHOOK_URL must be an absolute URL")
+	}
+	if u.Scheme != "https" && (u.Scheme != "http" || !isLoopback(u.Hostname())) {
+		return errors.New("WEBHOOK_URL must use https, plain http is allowed for loopback hosts only")
+	}
+	if u.User != nil {
+		return errors.New("WEBHOOK_URL must not carry credentials, requests are authenticated by WEBHOOK_SECRET")
+	}
+	if len(c.WebhookSecret) < minWebhookSecretLen {
+		return fmt.Errorf("WEBHOOK_SECRET must be at least %d characters", minWebhookSecretLen)
+	}
+	if c.WebhookTimeout <= 0 || c.WebhookRetryMin <= 0 || c.WebhookRetryMax < c.WebhookRetryMin {
+		return errors.New("WEBHOOK_TIMEOUT and WEBHOOK_RETRY_MIN must be positive, WEBHOOK_RETRY_MAX not below WEBHOOK_RETRY_MIN")
+	}
 	return nil
+}
+
+func isLoopback(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

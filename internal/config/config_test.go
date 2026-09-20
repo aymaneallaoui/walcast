@@ -67,3 +67,64 @@ func TestLoadTrimsPublicationTables(t *testing.T) {
 		t.Fatalf("tables = %q", got)
 	}
 }
+
+func webhookConfig() Config {
+	cfg := validConfig()
+	cfg.Sink = SinkWebhook
+	cfg.WebhookURL = "https://hooks.example.com/walcast"
+	cfg.WebhookSecret = "0123456789abcdef"
+	cfg.WebhookTimeout = time.Second
+	cfg.WebhookRetryMin = time.Millisecond
+	cfg.WebhookRetryMax = time.Second
+	return cfg
+}
+
+func TestValidate_webhookSink(t *testing.T) {
+	accepted := map[string]func(*Config){
+		"https":                 func(*Config) {},
+		"http to localhost":     func(c *Config) { c.WebhookURL = "http://localhost:8080/hook" },
+		"http to 127.0.0.1":     func(c *Config) { c.WebhookURL = "http://127.0.0.1:8080/hook" },
+		"http to ipv6 loopback": func(c *Config) { c.WebhookURL = "http://[::1]:8080/hook" },
+	}
+	for name, mutate := range accepted {
+		t.Run("accepts "+name, func(t *testing.T) {
+			cfg := webhookConfig()
+			mutate(&cfg)
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+
+	rejected := map[string]func(*Config){
+		"unknown sink":            func(c *Config) { c.Sink = "kafka" },
+		"missing url":             func(c *Config) { c.WebhookURL = "" },
+		"relative url":            func(c *Config) { c.WebhookURL = "/hook" },
+		"plain http to a remote":  func(c *Config) { c.WebhookURL = "http://hooks.example.com/walcast" },
+		"loopback lookalike host": func(c *Config) { c.WebhookURL = "http://localhost.example.com/hook" },
+		"credentials in url":      func(c *Config) { c.WebhookURL = "https://user:pass@hooks.example.com/" },
+		"non http scheme":         func(c *Config) { c.WebhookURL = "ftp://hooks.example.com/" },
+		"missing secret":          func(c *Config) { c.WebhookSecret = "" },
+		"short secret":            func(c *Config) { c.WebhookSecret = "short" },
+		"zero timeout":            func(c *Config) { c.WebhookTimeout = 0 },
+		"retry max below min":     func(c *Config) { c.WebhookRetryMax = c.WebhookRetryMin / 2 },
+	}
+	for name, mutate := range rejected {
+		t.Run("rejects "+name, func(t *testing.T) {
+			cfg := webhookConfig()
+			mutate(&cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("expected a validation error")
+			}
+		})
+	}
+}
+
+func TestValidate_stdoutIgnoresWebhookSettings(t *testing.T) {
+	cfg := validConfig()
+	cfg.Sink = SinkStdout
+	cfg.WebhookURL = "not a url"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
