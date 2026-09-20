@@ -54,7 +54,10 @@ A 2xx response means the batch is safely stored on your side: only then is its L
 - An update that changes the primary key is keyed by the new value, so it can land in a different partition than the row's earlier changes.
 - The producer is idempotent with `acks=all`: broker-side retries neither duplicate nor reorder records within a partition. A replay after a restart can still duplicate, so deduplicate on `commit_lsn` + `seq`.
 - An LSN is confirmed to Postgres only after every record of its batch was acknowledged by the brokers. Errors Kafka marks non-retriable (record too large, authorization, invalid topic) stop the process.
-- TLS is required unless every broker is a loopback host. SASL `plain`, `scram-sha-256` and `scram-sha-512` are supported.
+- TLS is required unless every broker is a loopback host. SASL `plain`, `scram-sha-256` and `scram-sha-512` are supported. A private CA is picked up from the system pool, which `SSL_CERT_FILE` or `SSL_CERT_DIR` can point at.
+- Table names that are not legal topic names (quoted identifiers, over 249 bytes with the prefix) are sanitised and get a short hash suffix; the chosen topic is logged.
+- A record above `KAFKA_MAX_MESSAGE_BYTES` stops the process with the topic, key and size in the error. Raise it together with the topic's `max.message.bytes`.
+- If the key columns of an updated row are TOASTed and unchanged, Postgres does not resend them and the key cannot be rebuilt, so that event is not guaranteed to share a partition with the row's other changes. This needs a key column over roughly 2 KB.
 
 ## Delivery
 
@@ -96,6 +99,7 @@ Read from the environment. A `.env` file is loaded if present and never override
 | `KAFKA_TLS` | `false` | must be `true` unless every broker is a loopback host |
 | `KAFKA_SASL_MECHANISM` | none | `plain`, `scram-sha-256` or `scram-sha-512` |
 | `KAFKA_SASL_USERNAME` / `KAFKA_SASL_PASSWORD` | | required with a mechanism |
+| `KAFKA_MAX_MESSAGE_BYTES` | `1000012` | largest record batch, match the topic's `max.message.bytes` |
 
 ## Layout
 
