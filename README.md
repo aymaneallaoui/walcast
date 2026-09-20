@@ -18,9 +18,9 @@ Other targets: `make build`, `make test`, `make test-integration` (uses `DATABAS
 
 The publication and the replication slot are created on first start if missing. An existing publication is never altered; a mismatch with `PUBLICATION_TABLES` is logged. If the slot disappears or is invalidated while walcast runs, it exits instead of recreating it, because a fresh slot would silently skip every change made in between.
 
-walcast also remembers the slot in the source database, in `STATE_SCHEMA.slots`, so the same protection holds across restarts. When the table knows a slot that no longer exists (dropped by hand, lost in a failover or a restore), walcast refuses to start and prints the exact `SLOT_RECREATE_GENERATION` value that accepts the gap. A value authorises at most one start: it is used up when the slot is recreated, and also when it was set while the slot still existed, so a forgotten variable cannot let a later loss through. A slot that already exists without a row is adopted. Changes to that one table are never emitted as events; any other table in the same schema streams normally.
+walcast also remembers the slot in the source database, in `STATE_SCHEMA.slots`, so the same protection holds across restarts. When the table knows a slot that no longer exists (dropped by hand, lost in a failover or a restore), walcast refuses to start and prints the exact `SLOT_RECREATE_GENERATION` value that accepts the gap. A value authorises at most one start: it is used up when the slot is recreated, and also when it was set while the slot still existed, so a forgotten variable cannot let a later loss through. A slot that already exists without a row is adopted. Changes to walcast's own two tables are never emitted as events; any other table in the same schema streams normally.
 
-On the first start the role needs `CREATE` on the database to make the schema and table. To run without it, create them ahead of time and grant the role `USAGE` on the schema and `SELECT, INSERT, UPDATE` on the table; walcast runs no DDL once the table exists:
+On the first start the role needs `CREATE` on the database to make the schema and table. To run without it, create them ahead of time and grant the role `USAGE` on the schema and `SELECT, INSERT, UPDATE` on the tables; walcast runs no DDL once a table exists (the second one is only needed for a backfill):
 
 ```sql
 CREATE SCHEMA walcast_state;
@@ -29,6 +29,17 @@ CREATE TABLE walcast_state.slots (
     generation   integer NOT NULL DEFAULT 0,
     created_at   timestamptz NOT NULL DEFAULT now(),
     recreated_at timestamptz
+);
+CREATE TABLE walcast_state.backfills (
+    table_name      text PRIMARY KEY,
+    table_oid       oid NOT NULL,
+    slot_generation integer NOT NULL,
+    status          text NOT NULL,
+    upper_key       text,
+    last_key        text,
+    rows_emitted    bigint NOT NULL DEFAULT 0,
+    started_at      timestamptz NOT NULL DEFAULT now(),
+    finished_at     timestamptz
 );
 ```
 
@@ -42,12 +53,30 @@ One JSON object per line:
 {"table":"public.users","op":"update","lsn":"0/16B3700","commit_lsn":"0/16B3748","seq":0,"txid":742,"ts":"2026-09-20T10:00:00Z","old":{"id":7},"new":{"id":7,"name":"x"},"unchanged":["bio"]}
 ```
 
-- `op` is `insert`, `update`, `delete` or `truncate`.
+- `op` is `insert`, `update`, `delete`, `truncate`, or `read` for a row copied by a backfill.
 - An update that changes the row's replica identity (its primary key) is emitted as a `delete` of the old key followed by an `insert` of the new one, both carrying `"origin":"update"`. Every key's history then stays self-consistent for consumers partitioned by key.
 - `commit_lsn` + `seq` identify an event; use them to deduplicate.
+- A `read` event carries the whole row in `new` and is an upsert. It has `backfill` + `seq` instead of `commit_lsn` and `txid`: a chunk is positioned at a marker in the WAL, and a marker's LSN can equal the `commit_lsn` of the next transaction, so the two must not share an id space. A repeated `read` is harmless to apply again.
+- The `insert` half of a key change can list `unchanged` columns. Take them from the row the preceding `delete` removed. During a backfill walcast sends such a row again as a `read`, so a consumer that started empty still gets every column.
 - `old` holds the replica identity columns only, or the full row with `REPLICA IDENTITY FULL`.
 - `unchanged` lists TOASTed columns Postgres did not resend. They are absent from `new`, not null.
+- Both connections pin `TimeZone=UTC`, `DateStyle`, `IntervalStyle`, `extra_float_digits` and `bytea_output`, so a value renders the same in a streamed event and in a `read`. `timestamptz` values are therefore in UTC.
 - Values: booleans, integers and floats are native JSON (`NaN` and `±Infinity` become strings), `jsonb` is embedded as is and `json` with its raw line breaks removed, `numeric` is a string to keep precision, everything else keeps its Postgres text form. Invalid UTF-8 becomes U+FFFD.
+
+## Backfill
+
+`BACKFILL_TABLES` copies the rows that existed before streaming started, as `read` events, while the stream keeps running. It is off by default, and each table is copied once; progress lives in `STATE_SCHEMA.backfills`, so a restart continues where it stopped and a crash repeats at most one chunk.
+
+Rows are read in primary-key chunks under a `REPEATABLE READ` snapshot. After each chunk walcast writes a marker into the WAL with `pg_logical_emit_message` and merges the chunk into the stream where that marker is decoded. A chunk row is dropped when the stream already delivered a newer complete image of the same key, and read again when the stream only delivered a patch that lacks an unchanged TOAST column. "Newer" is decided by transaction id, not by position: on Postgres a change can be decoded before any query can see it (a writer waiting for a synchronous standby is the long version of that window), so every change by a transaction at or above the chunk snapshot's `xmin` counts as newer. A consumer that applies events in order ends up with exactly the table.
+
+A table is refused, with an error that says why, unless all of this holds:
+
+- it is an ordinary table with a primary key and the default replica identity, not partitioned and without child tables
+- the publication includes it without a row filter or column list, and publishes insert, update, delete and truncate
+- row-level security does not hide rows from the walcast role
+- the source is a writable primary running Postgres 14 or newer
+
+The role needs `SELECT` on backfilled tables. A write transaction that was already open when the session started delays the first chunk until it ends, and walcast logs that it is waiting. While a key-changing update on a backfilled table is waiting for its row to be read again, the confirmed LSN stays before that transaction, so a crash replays it instead of forgetting it. Delete a table's row from `STATE_SCHEMA.backfills` to copy it again; accepting a slot gap with `SLOT_RECREATE_GENERATION` does that for every configured table, which is also how the gap gets repaired. With the Kafka sink and `KAFKA_EMIT_TRUNCATE` off, a `TRUNCATE` during or after a backfill is not visible to consumers.
 
 ## Sinks
 
@@ -95,6 +124,9 @@ Read from the environment. A `.env` file is loaded if present and never override
 | `PUBLICATION_TABLES` | all tables | comma separated `schema.table`; all tables needs superuser |
 | `STATE_SCHEMA` | `walcast_state` | schema in the source database for walcast's own state; not `public` or a system schema, and not the database role's name, because `search_path` starts with `"$user"` and the role's unqualified tables would land in it |
 | `SLOT_RECREATE_GENERATION` | `0` | set to the value from the "slot is gone" error to recreate a lost slot and accept the gap; each value works for one start only |
+| `BACKFILL_TABLES` | off | comma separated `schema.table` list, or `all` for every table of the publication; see Backfill |
+| `BACKFILL_CHUNK_ROWS` | `2000` | rows per chunk; shrinks by itself when a chunk hits the byte budget |
+| `BACKFILL_CHUNK_BYTES` | `4194304` | memory budget for one chunk's rows |
 | `LOG_LEVEL` | `info` | `trace`, `debug`, `info`, `warn`, `error` |
 | `LOG_FORMAT` | `json` | `json` or `console` |
 | `SHUTDOWN_TIMEOUT` | `10s` | drain deadline on SIGINT/SIGTERM |
@@ -126,7 +158,7 @@ Read from the environment. A `.env` file is loaded if present and never override
 ```
 cmd/walcast            entrypoint, signal handling
 internal/app           supervisor: reconnect with backoff
-internal/replication   connection, publication + slot setup, slot state table, receive loop, feedback
+internal/replication   connection, publication + slot setup, state tables, receive loop, feedback, backfill
 internal/event         pgoutput to JSON encoder, pooled batches
 internal/ledger        in-order ack tracking
 internal/sink          Sink interface, writer, webhook and Kafka sinks
