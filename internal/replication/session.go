@@ -132,7 +132,7 @@ func (r *Runner) Run(ctx context.Context) (pglogrepl.LSN, error) {
 	}
 	r.log.Info().Str("slot", r.cfg.SlotName).Msg("replication started")
 
-	s := newSession(r.cfg, r.log, pgStream{conn}, r.metrics)
+	s := newSession(r.cfg, r.log, &pgStream{conn: conn}, r.metrics)
 	if backfilling {
 		if s.link, err = newBackfillLink(); err != nil {
 			return 0, err
@@ -280,6 +280,7 @@ func (s *session) run(ctx context.Context, snk sink.Sink) (pglogrepl.LSN, error)
 	defer cancelSink()
 	loopCtx, stopLoop := context.WithCancel(ctx)
 	defer stopLoop()
+	defer context.AfterFunc(loopCtx, s.stream.Interrupt)()
 	go s.dispatch(sinkCtx, snk, stopLoop)
 
 	var backfill sync.WaitGroup
@@ -407,9 +408,7 @@ func (s *session) loop(ctx context.Context) error {
 		if s.sealable() && s.lingerAt.Before(deadline) {
 			deadline = s.lingerAt
 		}
-		recvCtx, cancel := context.WithDeadline(ctx, deadline)
-		msg, err := s.stream.Receive(recvCtx)
-		cancel()
+		msg, err := s.stream.Receive(deadline)
 		if err != nil {
 			if ledgerErr := s.ledger.Err(); ledgerErr != nil {
 				return ledgerErr
