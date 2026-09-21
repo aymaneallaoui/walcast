@@ -454,3 +454,28 @@ func TestBackfillChunkSizeRecoversAfterAWideRow(t *testing.T) {
 	}
 	t.Logf("%d rows in %d chunks", rows, len(chunks))
 }
+
+func TestBackfillMarkerIsFlushedWhenCommitsAreAsynchronous(t *testing.T) {
+	h := newHarness(t, nil)
+	current, err := strconv.ParseUint(string(h.exec("SELECT current_setting('server_version_num')")[0][0]), 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, version := range []uint64{160000, 170000} {
+		if version > current {
+			continue
+		}
+		before := string(h.exec("SELECT pg_current_wal_insert_lsn()")[0][0])
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err := replication.EmitMarker(ctx, h.cfg.DatabaseURL, version, "SET synchronous_commit = off")
+		cancel()
+		if err != nil {
+			t.Fatal(err)
+		}
+		flushed := h.exec(fmt.Sprintf("SELECT pg_current_wal_flush_lsn() > '%s'::pg_lsn", before))
+		if string(flushed[0][0]) != "t" {
+			t.Fatalf("server %d: marker written after %s was not flushed when emit returned", version, before)
+		}
+	}
+}

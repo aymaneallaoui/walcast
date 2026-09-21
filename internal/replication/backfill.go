@@ -514,10 +514,8 @@ func (w *backfillWorker) awaitResult(ctx context.Context, c *chunk) (chunkResult
 	}
 }
 
-// emit writes a marker and makes sure it is flushed. A non-transactional message is not flushed
-// when it is written, and a walsender only streams flushed WAL, so on a quiet database the marker
-// waited for the WAL writer: a fixed 204ms per chunk, whatever the chunk held. Postgres 17 can flush
-// with the message; before that, a transaction that commits right after it does the same.
+// emit flushes the marker too: a walsender only streams flushed WAL, so an unflushed marker waited
+// for the WAL writer, 204ms per chunk. Before Postgres 17 a synchronous commit does the flushing.
 func (w *backfillWorker) emit(ctx context.Context, m marker) error {
 	m.Session = w.link.session
 	payload, err := json.Marshal(m)
@@ -526,7 +524,7 @@ func (w *backfillWorker) emit(ctx context.Context, m marker) error {
 	}
 	sql := "SELECT pg_logical_emit_message(false, $1, $2, true)"
 	if w.serverVersion < 170000 {
-		sql = "SELECT pg_logical_emit_message(false, $1, $2), pg_current_xact_id()"
+		sql = "SELECT set_config('synchronous_commit', 'local', true), pg_logical_emit_message(false, $1, $2), pg_current_xact_id()"
 	}
 	if _, err := w.query(ctx, sql, markerPrefix, string(payload)); err != nil {
 		return fmt.Errorf("emit %s marker: %w", m.Kind, err)
