@@ -117,8 +117,8 @@ Set `METRICS_ADDR` (for example `127.0.0.1:9090`) to serve Prometheus metrics on
 | `walcast_delivery_failures_total`, `walcast_sink_retries_total` | failed deliveries that ended a session, and webhook retries |
 | `walcast_sink_delivery_seconds` | time a batch spent in the sink |
 | `walcast_end_to_end_seconds` | from the oldest commit in a batch to its delivery, so no event in the batch waited longer |
-| `walcast_received_lsn`, `walcast_delivered_lsn`, `walcast_reported_lsn` | stream positions; received minus reported is the backlog in WAL bytes, and reported stays behind delivered while an ack is held back |
-| `walcast_inflight_batches`, `walcast_inflight_bytes` | what the sink has not confirmed yet |
+| `walcast_received_lsn`, `walcast_delivered_lsn`, `walcast_reported_lsn` | stream positions; reported is the last position Postgres was actually sent, received minus reported is the backlog in WAL bytes, and reported stays behind delivered until the next feedback or while an ack is held back |
+| `walcast_inflight_batches`, `walcast_inflight_bytes` | batches the ledger still holds and the bytes the sink has not confirmed; a confirmed batch stays in the count until every batch before it is confirmed too |
 | `walcast_streaming`, `walcast_reconnects_total` | 1 while a session is up, and how often one had to be restarted |
 | `walcast_backfill_rows_total`, `walcast_backfill_chunks_total` | backfill progress |
 | `walcast_backfill_rows_superseded_total`, `walcast_backfill_rows_reread_total` | chunk rows dropped because the stream had a newer complete image, and rows read again |
