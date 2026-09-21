@@ -97,7 +97,9 @@ func (w *Webhook) Send(ctx context.Context, b *event.Batch, done func(error)) {
 			body = bytes.Clone(body)
 		}
 		if err == nil {
-			w.body = body
+			if cap(body) <= maxScratchCap {
+				w.body = body
+			}
 			done(nil)
 			return
 		}

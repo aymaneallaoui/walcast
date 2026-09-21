@@ -14,6 +14,10 @@ var ErrRejected = errors.New("sink: batch rejected")
 // ErrWriterBusy means an earlier write is still blocked, for instance on a pipe nobody reads.
 var ErrWriterBusy = errors.New("sink: previous write has not returned")
 
+// maxScratchCap bounds the private copies sinks reuse between batches, as the batch pool bounds its
+// own: without it one huge row would pin its size in memory for the life of the process.
+const maxScratchCap = 256 << 10
+
 // Sink delivers batches: Send is never called concurrently and must give up once ctx is cancelled.
 // done must be called exactly once per Send, with nil only when the batch is as durable as it gets.
 type Sink interface {
@@ -52,6 +56,9 @@ func (s *Writer) Send(ctx context.Context, b *event.Batch, done func(error)) {
 	result := make(chan error, 1)
 	go func() {
 		_, err := s.w.Write(s.buf)
+		if cap(s.buf) > maxScratchCap {
+			s.buf = nil
+		}
 		s.idle <- struct{}{}
 		result <- err
 	}()

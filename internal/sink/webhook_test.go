@@ -350,3 +350,34 @@ func TestWebhook_SendNeverLetsTheTransportReadThePooledBatch(t *testing.T) {
 		}
 	}
 }
+
+func TestSinksDoNotKeepAnOversizedScratchBuffer(t *testing.T) {
+	big := &event.Batch{Buf: bytes.Repeat([]byte("x"), 4*maxScratchCap), Events: 1}
+
+	t.Run("webhook", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+		t.Cleanup(srv.Close)
+		w := NewWebhook(WebhookConfig{URL: srv.URL, Secret: "0123456789abcdef", Timeout: time.Second, RetryMin: time.Millisecond, RetryMax: time.Millisecond}, zerolog.Nop())
+		w.Send(context.Background(), big, func(err error) {
+			if err != nil {
+				t.Errorf("Send: %v", err)
+			}
+		})
+		if cap(w.body) > maxScratchCap {
+			t.Fatalf("webhook kept a %d byte buffer after one large batch", cap(w.body))
+		}
+	})
+
+	t.Run("writer", func(t *testing.T) {
+		w := NewWriter(io.Discard)
+		w.Send(context.Background(), big, func(err error) {
+			if err != nil {
+				t.Errorf("Send: %v", err)
+			}
+		})
+		<-w.idle
+		if cap(w.buf) > maxScratchCap {
+			t.Fatalf("writer kept a %d byte buffer after one large batch", cap(w.buf))
+		}
+	})
+}
