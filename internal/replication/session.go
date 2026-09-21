@@ -335,7 +335,7 @@ func (s *session) observeDelivery(b *event.Batch, sent time.Time) {
 	bytes := len(b.Buf)
 	for _, rec := range b.Records {
 		if rec.Skipped {
-			bytes -= len(b.Value(rec))
+			bytes -= b.Size(rec)
 			s.metrics.EventsSkipped.Inc()
 			continue
 		}

@@ -42,6 +42,9 @@ func (b *Batch) Value(r Record) []byte { return b.Buf[r.valueStart:r.valueEnd] }
 
 func (b *Batch) Key(r Record) []byte { return b.Keys[r.keyStart:r.keyEnd] }
 
+// Size is what a record takes in Buf, its line terminator included.
+func (b *Batch) Size(r Record) int { return r.valueEnd - r.valueStart + 1 }
+
 var batchPool = sync.Pool{
 	New: func() any { return &Batch{Buf: make([]byte, 0, initialBatchCap)} },
 }
