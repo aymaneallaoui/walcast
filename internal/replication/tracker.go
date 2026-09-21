@@ -4,6 +4,9 @@ import "github.com/aymaneallaoui/walcast/internal/event"
 
 const maxTrackedKeys = 1 << 20
 
+// trackedKeysLimit is a variable only so that a test can reach an overflow with a handful of rows.
+var trackedKeysLimit = maxTrackedKeys
+
 type rowVerdict int
 
 const (
@@ -56,7 +59,7 @@ func (t *tracker) observe(rec event.Record, key []byte, xid uint32) {
 		return
 	}
 	prev, seen := t.keys[string(key)]
-	if !seen && len(t.keys) >= maxTrackedKeys {
+	if !seen && len(t.keys) >= trackedKeysLimit {
 		t.overflowed = true
 		t.keys = nil
 		return

@@ -37,3 +37,9 @@ func (r *Runner) WithSlotPoll(every time.Duration) *Runner {
 	r.slotPoll = every
 	return r
 }
+
+// SetTrackedKeysLimit lowers the key tracker's capacity until the returned function is called.
+func SetTrackedKeysLimit(n int) (restore func()) {
+	trackedKeysLimit = n
+	return func() { trackedKeysLimit = maxTrackedKeys }
+}
