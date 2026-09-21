@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -22,6 +23,7 @@ import (
 type countingSink struct {
 	events atomic.Int64
 	bytes  atomic.Int64
+	failed atomic.Pointer[error]
 }
 
 func (c *countingSink) Send(_ context.Context, b *event.Batch, done func(error)) {
@@ -36,6 +38,7 @@ type benchEnv struct {
 	admin *pgconn.PgConn
 	cfg   config.Config
 	table string
+	drop  func()
 }
 
 func newBenchEnv(b *testing.B, tune func(*config.Config)) *benchEnv {
@@ -63,7 +66,7 @@ func newBenchEnv(b *testing.B, tune func(*config.Config)) *benchEnv {
 		tune(&e.cfg)
 	}
 	e.exec(b, fmt.Sprintf("CREATE TABLE %s (id bigint PRIMARY KEY, name text, email text, active boolean, balance numeric, created timestamptz)", e.table))
-	b.Cleanup(func() {
+	e.drop = sync.OnceFunc(func() {
 		for _, sql := range []string{
 			fmt.Sprintf("SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = '%s' AND active", e.cfg.SlotName),
 			fmt.Sprintf("DROP PUBLICATION IF EXISTS %s", e.cfg.PublicationName),
@@ -80,6 +83,7 @@ func newBenchEnv(b *testing.B, tune func(*config.Config)) *benchEnv {
 		}
 		_ = admin.Close(context.Background())
 	})
+	b.Cleanup(e.drop)
 	return e
 }
 
@@ -101,6 +105,9 @@ func (e *benchEnv) run(b *testing.B, snk *countingSink) (stop func()) {
 	finished := make(chan error, 1)
 	go func() {
 		_, err := replication.NewRunner(e.cfg, snk, zerolog.Nop()).Run(ctx)
+		if err != nil && ctx.Err() == nil {
+			snk.failed.Store(&err)
+		}
 		finished <- err
 	}()
 	return func() {
@@ -115,6 +122,9 @@ func await(b *testing.B, snk *countingSink, want int64) {
 	b.Helper()
 	deadline := time.Now().Add(5 * time.Minute)
 	for snk.events.Load() < want {
+		if err := snk.failed.Load(); err != nil {
+			b.Fatalf("Run ended early: %v", *err)
+		}
 		if time.Now().After(deadline) {
 			b.Fatalf("got %d of %d events", snk.events.Load(), want)
 		}
@@ -191,6 +201,9 @@ func BenchmarkEndToEnd_Backfill(b *testing.B) {
 				await(b, snk, rows)
 				elapsed := time.Since(start).Seconds()
 				stop()
+				b.StopTimer()
+				e.drop()
+				b.StartTimer()
 				b.ReportMetric(rows/elapsed, "rows/s")
 				b.ReportMetric(float64(snk.bytes.Load())/elapsed/(1<<20), "MB/s")
 			}
