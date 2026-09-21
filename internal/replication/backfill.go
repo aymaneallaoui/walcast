@@ -35,6 +35,8 @@ const (
 	// A chunk that has not come back by then is abandoned with its session: xid widening assumes a
 	// chunk never lives long enough for the xid counter to move half its range.
 	chunkMaxAge = 10 * time.Minute
+	// maxQueryParams is what a Bind message can carry: its parameter count is a 16-bit integer.
+	maxQueryParams = 65535
 )
 
 // ErrBackfillRefused is fatal: the table or publication cannot be backfilled correctly as configured.
@@ -403,7 +405,7 @@ func (w *backfillWorker) backfill(ctx context.Context, table backfillTable, prog
 // whole chunk must be read again.
 func (w *backfillWorker) deliver(ctx context.Context, table backfillTable, c *chunk, fence uint64, queue [][]string) (emitted int, fresh uint64, err error) {
 	var (
-		batch  = w.cfg.BackfillChunkRows
+		batch  = rereadBatch(w.cfg.BackfillChunkRows, len(table.keyColumns))
 		number = c.number
 	)
 	for attempt := 0; ; attempt++ {
@@ -462,6 +464,11 @@ func (w *backfillWorker) deliver(ctx context.Context, table backfillTable, c *ch
 			return emitted, 0, nil
 		}
 	}
+}
+
+// rereadBatch keeps an exact re-read, one parameter per key column, under the protocol's limit.
+func rereadBatch(rows, keyColumns int) int {
+	return max(1, min(rows, maxQueryParams/max(1, keyColumns)))
 }
 
 // startTracking asks the owner goroutine, through the stream itself, to start a fresh key tracker,
