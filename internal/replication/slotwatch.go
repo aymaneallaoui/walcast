@@ -12,7 +12,12 @@ import (
 	"github.com/rs/zerolog"
 )
 
-const defaultSlotPoll = 15 * time.Second
+const (
+	defaultSlotPoll = 15 * time.Second
+	// slotPollTimeout bounds one check, connecting included: a connection that goes silent would
+	// otherwise leave the last values standing as if they were current.
+	slotPollTimeout = 10 * time.Second
+)
 
 var slotStatuses = []string{"reserved", "extended", "unreserved", "lost"}
 
@@ -70,13 +75,15 @@ func watchSlot(ctx context.Context, databaseURL, slot string, every time.Duratio
 	failing := false
 	for {
 		err := func() (err error) {
+			pollCtx, cancel := context.WithTimeout(ctx, slotPollTimeout)
+			defer cancel()
 			if conn == nil {
-				if conn, err = connectSQL(ctx, databaseURL); err != nil {
+				if conn, err = connectSQL(pollCtx, databaseURL); err != nil {
 					return err
 				}
 			}
-			if err = pollSlot(ctx, conn, slot, health, log); err != nil {
-				_ = conn.Close(ctx)
+			if err = pollSlot(pollCtx, conn, slot, health, log); err != nil {
+				_ = conn.Close(pollCtx)
 				conn = nil
 			}
 			return err
