@@ -33,8 +33,8 @@ type Batch struct {
 	Events  int
 	Seq     uint64
 	AckLSN  pglogrepl.LSN
-	// CommitNanos is when the oldest transaction that ends in this batch committed on the source, in
-	// Unix nanoseconds: no event in the batch waited longer. It stays zero for a fragment.
+	// CommitNanos is when the oldest transaction with an event in this batch committed on the source,
+	// in Unix nanoseconds: no event in the batch waited longer. Backfill reads leave it zero.
 	CommitNanos int64
 }
 

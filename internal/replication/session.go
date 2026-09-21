@@ -178,11 +178,11 @@ type session struct {
 	queue      chan *event.Batch
 	dispatched chan struct{}
 
-	cur       *event.Batch
-	pending   *event.Batch
-	inTx      bool
-	txEmitted bool
-	xid       uint32
+	cur           *event.Batch
+	pending       *event.Batch
+	inTx          bool
+	txCommitNanos int64
+	xid           uint32
 
 	link      *backfillLink
 	systemID  string
@@ -485,7 +485,7 @@ func (s *session) handleXLogData(data []byte) error {
 		s.enc.Relation(m)
 	case *pglogrepl.BeginMessage:
 		s.enc.Begin(m)
-		s.inTx, s.txEmitted = true, false
+		s.inTx, s.txCommitNanos = true, m.CommitTime.UnixNano()
 		s.xid, s.commitLSN = m.Xid, m.FinalLSN
 	case *pglogrepl.LogicalDecodingMessage:
 		s.handleMarker(m)
@@ -499,9 +499,6 @@ func (s *session) handleXLogData(data []byte) error {
 		err = s.enc.Truncate(s.cur, xld.WALStart, m)
 	case *pglogrepl.CommitMessage:
 		s.inTx = false
-		if s.txEmitted && s.cur.Events > 0 && s.cur.CommitNanos == 0 {
-			s.cur.CommitNanos = m.CommitTime.UnixNano()
-		}
 		if s.cur.Dirty() || !s.ledger.AdvanceIdle(m.TransactionEndLSN) {
 			s.cur.AckLSN = m.TransactionEndLSN
 		}
@@ -509,8 +506,8 @@ func (s *session) handleXLogData(data []byte) error {
 	if err != nil {
 		return fmt.Errorf("encode event at %s: %w", xld.WALStart, err)
 	}
-	if len(s.cur.Records) > recorded && s.inTx {
-		s.txEmitted = true
+	if len(s.cur.Records) > recorded && s.inTx && s.cur.CommitNanos == 0 {
+		s.cur.CommitNanos = s.txCommitNanos
 	}
 	if s.backfilling {
 		s.observe(s.cur.Records[recorded:])
