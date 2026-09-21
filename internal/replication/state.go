@@ -17,7 +17,8 @@ const (
 
 	// Class 42 is "syntax error or access rule violation": missing privilege, wrong column, reserved
 	// name. The same statement fails the same way on every reconnect.
-	sqlClassAccessRuleViolation = "42"
+	sqlClassAccessRuleViolation   = "42"
+	sqlStateInsufficientPrivilege = "42501"
 )
 
 var (

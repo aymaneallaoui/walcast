@@ -3,10 +3,13 @@ package replication
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/jackc/pglogrepl"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/rs/zerolog"
 
 	"github.com/aymaneallaoui/walcast/internal/event"
@@ -345,5 +348,26 @@ func TestRereadBatch(t *testing.T) {
 				t.Fatalf("rereadBatch(%d, %d) = %d, want %d", tt.rows, tt.keyColumns, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestBackfillError(t *testing.T) {
+	denied := fmt.Errorf("read chunk of public.users: %w", &pgconn.PgError{Code: "42501", Message: "permission denied for table users"})
+	if err := backfillError(denied); !errors.Is(err, ErrBackfillRefused) {
+		t.Fatalf("a missing privilege is retried forever: %v", err)
+	}
+	dropped := fmt.Errorf("read chunk of public.users: %w", &pgconn.PgError{Code: "42703", Message: "column does not exist"})
+	if err := backfillError(dropped); errors.Is(err, ErrBackfillRefused) {
+		t.Fatalf("a dropped column heals on the next describe and must be retried: %v", err)
+	}
+}
+
+func TestStateError(t *testing.T) {
+	denied := stateError("record slot", &pgconn.PgError{Code: "42501"})
+	if !errors.Is(denied, ErrStateStore) {
+		t.Fatalf("permission denied on the state table is not fatal: %v", denied)
+	}
+	if busy := stateError("record slot", &pgconn.PgError{Code: "57P03"}); errors.Is(busy, ErrStateStore) {
+		t.Fatalf("a server that is starting up was made fatal: %v", busy)
 	}
 }
