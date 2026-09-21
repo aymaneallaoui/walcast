@@ -156,9 +156,18 @@ func runBackfill(ctx context.Context, cfg config.Config, log zerolog.Logger, lin
 
 	w := &backfillWorker{cfg: cfg, log: log, link: link, conn: conn, systemID: systemID, chunkRows: cfg.BackfillChunkRows}
 	if err := w.run(ctx); err != nil && ctx.Err() == nil {
-		return fmt.Errorf("backfill: %w", err)
+		return backfillError(err)
 	}
 	return nil
+}
+
+// backfillError makes a missing privilege fatal: a reconnect would run the same query as the same
+// role, and retrying it forever hides a setup mistake behind a reconnect loop.
+func backfillError(err error) error {
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok && pgErr.Code == sqlStateInsufficientPrivilege {
+		return fmt.Errorf("%w: %w", ErrBackfillRefused, err)
+	}
+	return fmt.Errorf("backfill: %w", err)
 }
 
 func (w *backfillWorker) run(ctx context.Context) error {
