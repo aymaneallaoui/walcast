@@ -219,6 +219,26 @@ func TestSession_handleXLogData(t *testing.T) {
 		}
 	})
 
+	t.Run("commit that emitted nothing leaves no commit time behind", func(t *testing.T) {
+		s := newSession(testConfig(), zerolog.Nop(), newFakeStream())
+		for _, payload := range [][]byte{beginMsg(90, 7), commitMsg(90, 100)} {
+			if err := s.handleXLogData(xlogData(50, payload).Data[1:]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if s.cur.CommitNanos != 0 {
+			t.Fatalf("clean batch kept commit time %d", s.cur.CommitNanos)
+		}
+		for _, payload := range [][]byte{relationMsg(), beginMsg(190, 8), insertMsg("1", "a"), commitMsg(190, 200)} {
+			if err := s.handleXLogData(xlogData(150, payload).Data[1:]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if s.cur.CommitNanos == 0 {
+			t.Fatal("commit that emitted an event set no commit time")
+		}
+	})
+
 	t.Run("change for an unknown relation is unencodable", func(t *testing.T) {
 		s := newSession(testConfig(), zerolog.Nop(), newFakeStream())
 		err := s.handleXLogData(xlogData(50, insertMsg("1", "a")).Data[1:])
