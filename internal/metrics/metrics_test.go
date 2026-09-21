@@ -11,6 +11,7 @@ func TestWrite(t *testing.T) {
 	m := New()
 	m.EventsDelivered["insert"].Add(3)
 	m.Delivery.Observe(20 * time.Millisecond)
+	m.EndToEnd.Observe(-time.Second)
 	m.Gauge("walcast_inflight_batches", func() float64 { return 7 })
 
 	var out bytes.Buffer
@@ -26,6 +27,8 @@ func TestWrite(t *testing.T) {
 		{"summary quantile", `walcast_sink_delivery_seconds{quantile="0.99"}`},
 		{"prometheus le bucket", `walcast_sink_delivery_seconds_hist_bucket{le="0.025"} 1`},
 		{"bucket below the observation stays empty", `walcast_sink_delivery_seconds_hist_bucket{le="0.01"} 0`},
+		{"negative age lands in the first bucket", `walcast_end_to_end_seconds_hist_bucket{le="0.001"} 1`},
+		{"negative age counts in the summary as zero", `walcast_end_to_end_seconds_sum 0`},
 		{"gauge read at scrape time", `walcast_inflight_batches 7`},
 		{"go runtime metrics", `go_goroutines`},
 	}
