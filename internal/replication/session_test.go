@@ -32,31 +32,39 @@ func testConfig() config.Config {
 }
 
 type fakeStream struct {
-	msgs chan pgproto3.BackendMessage
-	errs chan error
+	msgs        chan pgproto3.BackendMessage
+	errs        chan error
+	interrupted chan struct{}
+	interrupt   sync.Once
 
 	mu       sync.Mutex
 	statuses []pglogrepl.LSN
 }
 
 func newFakeStream(msgs ...pgproto3.BackendMessage) *fakeStream {
-	f := &fakeStream{msgs: make(chan pgproto3.BackendMessage, 64), errs: make(chan error, 1)}
+	f := &fakeStream{msgs: make(chan pgproto3.BackendMessage, 64), errs: make(chan error, 1), interrupted: make(chan struct{})}
 	for _, m := range msgs {
 		f.msgs <- m
 	}
 	return f
 }
 
-func (f *fakeStream) Receive(ctx context.Context) (pgproto3.BackendMessage, error) {
+func (f *fakeStream) Receive(deadline time.Time) (pgproto3.BackendMessage, error) {
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
 	select {
 	case m := <-f.msgs:
 		return m, nil
 	case err := <-f.errs:
 		return nil, err
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	case <-timer.C:
+		return nil, context.DeadlineExceeded
+	case <-f.interrupted:
+		return nil, context.DeadlineExceeded
 	}
 }
+
+func (f *fakeStream) Interrupt() { f.interrupt.Do(func() { close(f.interrupted) }) }
 
 func (f *fakeStream) SendStatus(flushed pglogrepl.LSN, _ bool, _ time.Duration) error {
 	f.mu.Lock()
