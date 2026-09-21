@@ -462,8 +462,9 @@ func TestBackfillMarkerIsFlushedWhenCommitsAreAsynchronous(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The path for older servers is valid SQL on every supported one, so it is always exercised.
 	for _, version := range []uint64{160000, 170000} {
-		if version > current {
+		if version == 170000 && current < version {
 			continue
 		}
 		before := string(h.exec("SELECT pg_current_wal_insert_lsn()")[0][0])
