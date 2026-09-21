@@ -20,7 +20,7 @@ const (
 
 const (
 	hexDigits       = "0123456789abcdef"
-	replacementChar = `�`
+	replacementChar = "\uFFFD"
 )
 
 var (
@@ -88,7 +88,7 @@ func appendString(dst, s []byte) []byte {
 			dst = append(dst, s[start:i]...)
 			dst = append(dst, replacementChar...)
 			start = i + size
-		case r == '\u0085' || r == ' ' || r == ' ':
+		case r == '\u0085' || r == '\u2028' || r == '\u2029':
 			dst = append(dst, s[start:i]...)
 			dst = append(dst, '\\', 'u', hexDigits[r>>12&0xf], hexDigits[r>>8&0xf], hexDigits[r>>4&0xf], hexDigits[r&0xf])
 			start = i + size
