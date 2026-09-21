@@ -141,7 +141,7 @@ func closedWithin(t *testing.T, conn net.Conn, d time.Duration) bool {
 	}
 	var timeout net.Error
 	_, err := io.ReadAll(conn)
-	return !(errors.As(err, &timeout) && timeout.Timeout())
+	return !errors.As(err, &timeout) || !timeout.Timeout()
 }
 
 func TestServeDropsARequestThatNeverSendsItsBody(t *testing.T) {
