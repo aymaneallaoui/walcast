@@ -403,6 +403,9 @@ func TestBackfillReadsParkedKeysBeforeResumingTheScan(t *testing.T) {
 	h.exec(fmt.Sprintf("INSERT INTO %s SELECT g, 'seed ' || g, true FROM generate_series(1, 20) g", h.table))
 	h.startSession()()
 	backfillOf(100, 1<<20)(&h.cfg)
+	if err := replication.EnsureBackfillTable(context.Background(), h.cfg.DatabaseURL, h.cfg.StateSchema); err != nil {
+		t.Fatal(err)
+	}
 
 	h.exec(fmt.Sprintf(`INSERT INTO %s.backfills (table_name, table_oid, slot_generation, status, upper_key, last_key, pending_keys)
 VALUES ('public.%s', 'public.%s'::regclass::oid, 0, 'running', '["20"]', '["10"]', '[["5"]]')`, h.cfg.StateSchema, h.table, h.table))
