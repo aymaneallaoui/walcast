@@ -332,12 +332,18 @@ func (s *session) observeDelivery(b *event.Batch, sent time.Time) {
 		s.metrics.EndToEnd.Observe(time.Duration(now.UnixNano() - b.CommitNanos))
 	}
 	s.metrics.BatchesDelivered.Inc()
-	s.metrics.BytesDelivered.Add(len(b.Buf))
+	bytes := len(b.Buf)
 	for _, rec := range b.Records {
+		if rec.Skipped {
+			bytes -= len(b.Value(rec))
+			s.metrics.EventsSkipped.Inc()
+			continue
+		}
 		if counter := s.metrics.EventsDelivered[rec.Op]; counter != nil {
 			counter.Inc()
 		}
 	}
+	s.metrics.BytesDelivered.Add(bytes)
 }
 
 func (s *session) loop(ctx context.Context) error {

@@ -19,7 +19,9 @@ type Record struct {
 	Table        string
 	// Partial marks an update that left out an unchanged TOAST column: a consumer that has never
 	// seen the row cannot rebuild it from this event alone.
-	Partial              bool
+	Partial bool
+	// Skipped is set by a sink that chose not to send this record, so delivery is not counted for it.
+	Skipped              bool
 	valueStart, valueEnd int
 	keyStart, keyEnd     int
 }

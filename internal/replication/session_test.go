@@ -248,6 +248,28 @@ func TestSession_handleXLogData(t *testing.T) {
 	})
 }
 
+func TestSession_observeDelivery(t *testing.T) {
+	s := newSession(testConfig(), zerolog.Nop(), newFakeStream())
+	for _, payload := range [][]byte{relationMsg(), beginMsg(90, 7), insertMsg("1", "a"), insertMsg("2", "b"), commitMsg(90, 100)} {
+		if err := s.handleXLogData(xlogData(50, payload).Data[1:]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.cur.Records[0].Skipped = true
+	kept := len(s.cur.Buf) - len(s.cur.Value(s.cur.Records[0]))
+	s.observeDelivery(s.cur, time.Now())
+
+	if got := s.metrics.EventsDelivered["insert"].Get(); got != 1 {
+		t.Fatalf("delivered inserts = %d, want 1", got)
+	}
+	if got := s.metrics.EventsSkipped.Get(); got != 1 {
+		t.Fatalf("skipped = %d, want 1", got)
+	}
+	if got := s.metrics.BytesDelivered.Get(); got != uint64(kept) {
+		t.Fatalf("bytes = %d, want %d", got, kept)
+	}
+}
+
 func TestSession_handleKeepalive(t *testing.T) {
 	t.Run("advances only outside a transaction with a clean batch", func(t *testing.T) {
 		s := newSession(testConfig(), zerolog.Nop(), newFakeStream())

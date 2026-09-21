@@ -112,6 +112,7 @@ Set `METRICS_ADDR` (for example `127.0.0.1:9090`) to serve Prometheus metrics on
 | Metric | Meaning |
 | --- | --- |
 | `walcast_events_delivered_total{op}` | events the sink confirmed, by `insert`, `update`, `delete`, `truncate`, `read` |
+| `walcast_events_skipped_total` | events a sink chose not to send, such as truncates to Kafka without `KAFKA_EMIT_TRUNCATE`; not counted as delivered |
 | `walcast_batches_delivered_total`, `walcast_bytes_delivered_total` | delivered batches and their JSON bytes |
 | `walcast_delivery_failures_total`, `walcast_sink_retries_total` | failed deliveries that ended a session, and webhook retries |
 | `walcast_sink_delivery_seconds` | time a batch spent in the sink |

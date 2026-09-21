@@ -114,11 +114,12 @@ func saslMechanism(cfg KafkaConfig) (sasl.Mechanism, error) {
 // method value is bound once: binding it per record cost one allocation per event (measured).
 func (k *Kafka) Send(ctx context.Context, b *event.Batch, done func(error)) {
 	records := make([]kgo.Record, 0, len(b.Records))
-	for _, r := range b.Records {
+	for i, r := range b.Records {
 		// A truncate is keyed by table while rows are keyed by identity, so a consumer can read it
 		// after a later insert from another partition and wipe that new row.
 		if r.Op == event.OpTruncate && !k.emitTruncate {
 			k.log.Warn().Str("table", r.Table).Msg("truncate not sent to kafka, set KAFKA_EMIT_TRUNCATE=true to send it")
+			b.Records[i].Skipped = true
 			continue
 		}
 		records = append(records, kgo.Record{Topic: k.topic(r.Schema, r.Name), Key: b.Key(r), Value: b.Value(r)})
