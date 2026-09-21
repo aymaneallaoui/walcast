@@ -18,3 +18,13 @@ func EmitMarker(ctx context.Context, databaseURL string, serverVersion uint64, s
 	w := &backfillWorker{conn: conn, link: &backfillLink{session: "flush-test"}, serverVersion: serverVersion}
 	return w.emit(ctx, marker{Kind: markerStop})
 }
+
+// EnsureBackfillTable lets a test seed progress without depending on an earlier test's backfill.
+func EnsureBackfillTable(ctx context.Context, databaseURL, schema string) error {
+	conn, err := connectSQL(ctx, databaseURL)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close(context.Background()) }()
+	return ensureBackfillTable(ctx, conn, schema)
+}
