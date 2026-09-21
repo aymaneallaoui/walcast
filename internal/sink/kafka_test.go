@@ -230,8 +230,12 @@ func TestKafka_SendTruncates(t *testing.T) {
 
 	t.Run("skipped by default, the rest of the batch is delivered", func(t *testing.T) {
 		snk, cluster := newSink(t, false)
-		if err := sendKafka(t, context.Background(), snk, batch(t)); err != nil {
+		b := batch(t)
+		if err := sendKafka(t, context.Background(), snk, b); err != nil {
 			t.Fatal(err)
+		}
+		if !b.Records[0].Skipped || b.Records[1].Skipped {
+			t.Fatalf("skipped = %v, %v, want only the truncate marked", b.Records[0].Skipped, b.Records[1].Skipped)
 		}
 		got := consume(t, cluster, 1, topic)
 		if len(got) != 1 || !bytes.Contains(got[0].Value, []byte(`"op":"insert"`)) {

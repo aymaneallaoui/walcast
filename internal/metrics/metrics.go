@@ -31,6 +31,7 @@ type Metrics struct {
 	set *vm.Set
 
 	EventsDelivered  map[string]*vm.Counter
+	EventsSkipped    *vm.Counter
 	BatchesDelivered *vm.Counter
 	BytesDelivered   *vm.Counter
 	DeliveryFailures *vm.Counter
@@ -55,6 +56,7 @@ func New() *Metrics {
 	m := &Metrics{
 		set:              set,
 		EventsDelivered:  make(map[string]*vm.Counter, len(Ops)),
+		EventsSkipped:    set.NewCounter("walcast_events_skipped_total"),
 		BatchesDelivered: set.NewCounter("walcast_batches_delivered_total"),
 		BytesDelivered:   set.NewCounter("walcast_bytes_delivered_total"),
 		DeliveryFailures: set.NewCounter("walcast_delivery_failures_total"),
