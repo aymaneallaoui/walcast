@@ -260,7 +260,7 @@ func TestSession_observeDelivery(t *testing.T) {
 		}
 	}
 	s.cur.Records[0].Skipped = true
-	kept := len(s.cur.Buf) - len(s.cur.Value(s.cur.Records[0]))
+	kept := len(s.cur.Value(s.cur.Records[1])) + 1
 	s.observeDelivery(s.cur, time.Now())
 
 	if got := s.metrics.EventsDelivered["insert"].Get(); got != 1 {
@@ -271,6 +271,12 @@ func TestSession_observeDelivery(t *testing.T) {
 	}
 	if got := s.metrics.BytesDelivered.Get(); got != uint64(kept) {
 		t.Fatalf("bytes = %d, want %d", got, kept)
+	}
+
+	s.cur.Records[1].Skipped = true
+	s.observeDelivery(s.cur, time.Now())
+	if got := s.metrics.BytesDelivered.Get(); got != uint64(kept) {
+		t.Fatalf("a batch the sink skipped entirely added bytes: %d, want %d", got, kept)
 	}
 }
 
