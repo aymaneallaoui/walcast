@@ -216,24 +216,43 @@ func TestProvisionedStateTableNeedsNoCreatePrivilege(t *testing.T) {
 }
 
 func TestBackfillTableMadeBeforeSlotsIsRekeyed(t *testing.T) {
-	h := newHarness(t, nil)
-	schema := fmt.Sprintf("walcast_rekey_%d", time.Now().UnixNano())
-	h.exec(fmt.Sprintf(`CREATE SCHEMA %[1]s; CREATE TABLE %[1]s.backfills (
+	legacy := func(t *testing.T, h *harness, slots ...string) string {
+		schema := fmt.Sprintf("walcast_rekey_%d", time.Now().UnixNano())
+		h.exec(fmt.Sprintf(`CREATE SCHEMA %[1]s;
+CREATE TABLE %[1]s.slots (slot_name text PRIMARY KEY, generation integer NOT NULL DEFAULT 0);
+CREATE TABLE %[1]s.backfills (
 	table_name text PRIMARY KEY, table_oid oid NOT NULL, slot_generation integer NOT NULL, status text NOT NULL,
 	upper_key text, last_key text, pending_keys text, rows_emitted bigint NOT NULL DEFAULT 0,
 	started_at timestamptz NOT NULL DEFAULT now(), finished_at timestamptz);
 INSERT INTO %[1]s.backfills (table_name, table_oid, slot_generation, status) VALUES ('public.users', 1, 0, 'done')`, schema))
-	t.Cleanup(func() { h.exec(fmt.Sprintf("DROP SCHEMA %s CASCADE", schema)) })
-
-	for range 2 {
-		if err := replication.EnsureBackfillTable(context.Background(), h.cfg.DatabaseURL, schema, "first_slot"); err != nil {
-			t.Fatal(err)
+		for _, slot := range slots {
+			h.exec(fmt.Sprintf("INSERT INTO %s.slots (slot_name) VALUES ('%s')", schema, slot))
 		}
+		t.Cleanup(func() { h.exec(fmt.Sprintf("DROP SCHEMA %s CASCADE", schema)) })
+		for range 2 {
+			if err := replication.EnsureBackfillTable(context.Background(), h.cfg.DatabaseURL, schema); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return schema
 	}
-	if got := h.exec(fmt.Sprintf("SELECT slot_name FROM %s.backfills WHERE table_name = 'public.users'", schema)); len(got) != 1 || string(got[0][0]) != "first_slot" {
-		t.Fatalf("existing progress now belongs to %v, want the slot that made it", got)
-	}
-	h.exec(fmt.Sprintf("INSERT INTO %s.backfills (slot_name, table_name, table_oid, slot_generation, status) VALUES ('second_slot', 'public.users', 1, 0, 'running')", schema))
+
+	t.Run("one known slot keeps its progress", func(t *testing.T) {
+		h := newHarness(t, nil)
+		schema := legacy(t, h, "only_slot")
+		if got := h.exec(fmt.Sprintf("SELECT slot_name FROM %s.backfills WHERE table_name = 'public.users'", schema)); len(got) != 1 || string(got[0][0]) != "only_slot" {
+			t.Fatalf("existing progress now belongs to %v, want the only slot there is", got)
+		}
+		h.exec(fmt.Sprintf("INSERT INTO %s.backfills (slot_name, table_name, table_oid, slot_generation, status) VALUES ('second_slot', 'public.users', 1, 0, 'running')", schema))
+	})
+
+	t.Run("with several slots nobody inherits progress that may not be theirs", func(t *testing.T) {
+		h := newHarness(t, nil)
+		schema := legacy(t, h, "slot_a", "slot_b")
+		if got := h.exec(fmt.Sprintf("SELECT slot_name FROM %s.backfills", schema)); len(got) != 0 {
+			t.Fatalf("progress of unknown origin was kept for %v: that slot would skip its copy", got)
+		}
+	})
 }
 
 // Two processes can start on the same lost slot with the same override. Only one of them may use

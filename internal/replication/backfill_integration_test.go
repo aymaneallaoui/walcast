@@ -408,7 +408,7 @@ func TestBackfillReadsParkedKeysBeforeResumingTheScan(t *testing.T) {
 	h.exec(fmt.Sprintf("INSERT INTO %s SELECT g, 'seed ' || g, true FROM generate_series(1, 20) g", h.table))
 	h.startSession()()
 	backfillOf(100, 1<<20)(&h.cfg)
-	if err := replication.EnsureBackfillTable(context.Background(), h.cfg.DatabaseURL, h.cfg.StateSchema, h.cfg.SlotName); err != nil {
+	if err := replication.EnsureBackfillTable(context.Background(), h.cfg.DatabaseURL, h.cfg.StateSchema); err != nil {
 		t.Fatal(err)
 	}
 

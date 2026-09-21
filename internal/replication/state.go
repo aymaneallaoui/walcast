@@ -130,7 +130,7 @@ type backfillProgress struct {
 // ensureBackfillTable follows ensureStateTable: no DDL once the table exists, so it can be
 // provisioned ahead of time for a role without CREATE. Progress is per slot: two pipelines may copy
 // one table to different destinations, and a table made before that was known is rekeyed once.
-func ensureBackfillTable(ctx context.Context, conn *pgconn.PgConn, schema, slot string) error {
+func ensureBackfillTable(ctx context.Context, conn *pgconn.PgConn, schema string) error {
 	rows, err := queryParams(ctx, conn, `
 SELECT to_regclass($1) IS NOT NULL,
        EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass($1) AND attname = 'slot_name' AND NOT attisdropped)`,
@@ -143,10 +143,14 @@ SELECT to_regclass($1) IS NOT NULL,
 	case exists && perSlot:
 		return nil
 	case exists:
-		ddl := fmt.Sprintf(`ALTER TABLE %[1]s.%[2]s ADD COLUMN slot_name text NOT NULL DEFAULT '%[3]s';
-ALTER TABLE %[1]s.%[2]s ALTER COLUMN slot_name DROP DEFAULT;
+		// Old rows do not say which slot made them: with one known slot they are its own. With
+		// several, a slot inheriting another's "done" would skip its copy, so they are dropped.
+		ddl := fmt.Sprintf(`ALTER TABLE %[1]s.%[2]s ADD COLUMN slot_name text;
+UPDATE %[1]s.%[2]s SET slot_name = (SELECT min(slot_name) FROM %[1]s.%[3]s) WHERE (SELECT count(*) FROM %[1]s.%[3]s) = 1;
+DELETE FROM %[1]s.%[2]s WHERE slot_name IS NULL;
+ALTER TABLE %[1]s.%[2]s ALTER COLUMN slot_name SET NOT NULL;
 ALTER TABLE %[1]s.%[2]s DROP CONSTRAINT %[2]s_pkey;
-ALTER TABLE %[1]s.%[2]s ADD PRIMARY KEY (slot_name, table_name)`, schema, progressTable, slot)
+ALTER TABLE %[1]s.%[2]s ADD PRIMARY KEY (slot_name, table_name)`, schema, progressTable, stateTable)
 		if _, err := conn.Exec(ctx, ddl).ReadAll(); err != nil {
 			return stateError("rekey backfill table by slot", err)
 		}

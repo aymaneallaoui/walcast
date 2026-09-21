@@ -46,7 +46,7 @@ CREATE TABLE walcast_state.backfills (
 );
 ```
 
-Backfill progress belongs to a slot, so two pipelines can copy one table to different destinations. A `backfills` table made before progress was kept per slot is rekeyed on the next start, which needs ownership of the table.
+Backfill progress belongs to a slot, so two pipelines can copy one table to different destinations. A `backfills` table made before progress was kept per slot is rekeyed on the next start, which needs ownership of the table. Its rows are kept when the state schema knows exactly one slot; with several their origin is unknown, so they are dropped and those tables are copied again.
 
 Anyone who can write to this table can switch the protection off, so grant it to the walcast role only.
 
