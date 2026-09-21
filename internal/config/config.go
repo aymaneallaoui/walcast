@@ -38,7 +38,7 @@ var (
 type Config struct {
 	LogLevel        string        `env:"LOG_LEVEL" envDefault:"info"`
 	LogFormat       string        `env:"LOG_FORMAT" envDefault:"json"`
-	DatabaseURL     string        `env:"DATABASE_URL,notEmpty"`
+	DatabaseURL     string        `env:"DATABASE_URL,notEmpty,unset"`
 	ShutdownTimeout time.Duration `env:"SHUTDOWN_TIMEOUT" envDefault:"10s"`
 	SettleTimeout   time.Duration `env:"SINK_SETTLE_TIMEOUT" envDefault:"5m"`
 
@@ -67,7 +67,7 @@ type Config struct {
 
 	Sink            string        `env:"SINK" envDefault:"stdout"`
 	WebhookURL      string        `env:"WEBHOOK_URL"`
-	WebhookSecret   string        `env:"WEBHOOK_SECRET"`
+	WebhookSecret   string        `env:"WEBHOOK_SECRET,unset"`
 	WebhookTimeout  time.Duration `env:"WEBHOOK_TIMEOUT" envDefault:"10s"`
 	WebhookRetryMin time.Duration `env:"WEBHOOK_RETRY_MIN" envDefault:"500ms"`
 	WebhookRetryMax time.Duration `env:"WEBHOOK_RETRY_MAX" envDefault:"30s"`
@@ -78,11 +78,13 @@ type Config struct {
 	KafkaTLS             bool     `env:"KAFKA_TLS"`
 	KafkaSASLMechanism   string   `env:"KAFKA_SASL_MECHANISM"`
 	KafkaSASLUsername    string   `env:"KAFKA_SASL_USERNAME"`
-	KafkaSASLPassword    string   `env:"KAFKA_SASL_PASSWORD"`
+	KafkaSASLPassword    string   `env:"KAFKA_SASL_PASSWORD,unset"`
 	KafkaEmitTruncate    bool     `env:"KAFKA_EMIT_TRUNCATE"`
 	KafkaMaxMessageBytes int32    `env:"KAFKA_MAX_MESSAGE_BYTES" envDefault:"1000012"`
 }
 
+// Load takes the three secrets out of the process environment once they are read, so they are not
+// left in /proc/<pid>/environ, a core dump or a future child process.
 func Load() (Config, error) {
 	if err := godotenv.Load(); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return Config{}, fmt.Errorf("load .env: %w", err)

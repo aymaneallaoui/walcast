@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -97,6 +98,33 @@ func TestLoadTrimsPublicationTables(t *testing.T) {
 	}
 	if got := cfg.PublicationTables; len(got) != 2 || got[1] != "public.b" {
 		t.Fatalf("tables = %q", got)
+	}
+}
+
+func TestLoadTakesSecretsOutOfTheEnvironment(t *testing.T) {
+	t.Chdir(t.TempDir())
+	secrets := map[string]string{
+		"DATABASE_URL":        "postgres://walcast:hunter2@localhost/db",
+		"WEBHOOK_SECRET":      "0123456789abcdef",
+		"KAFKA_SASL_PASSWORD": "broker-password",
+	}
+	for name, value := range secrets {
+		t.Setenv(name, value)
+	}
+	t.Setenv("SINK", SinkWebhook)
+	t.Setenv("WEBHOOK_URL", "https://hooks.example.com/walcast")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.DatabaseURL != secrets["DATABASE_URL"] || cfg.WebhookSecret != secrets["WEBHOOK_SECRET"] {
+		t.Fatal("secrets were not read before being removed")
+	}
+	for name := range secrets {
+		if _, still := os.LookupEnv(name); still {
+			t.Errorf("%s is still in the process environment", name)
+		}
 	}
 }
 
