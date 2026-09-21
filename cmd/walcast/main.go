@@ -46,7 +46,13 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		go func() { served <- metrics.Serve(ctx, ln, m, cfg.PprofEnabled, log) }()
+		go func() {
+			err := metrics.Serve(ctx, ln, m, cfg.PprofEnabled, log)
+			if err != nil {
+				log.Error().Err(err).Msg("metrics listener stopped, walcast keeps streaming without it")
+			}
+			served <- err
+		}()
 	}
 
 	snk, err := newSink(cfg, log, m)
@@ -55,9 +61,7 @@ func run() error {
 	}
 	err = app.New(cfg, log, snk).WithMetrics(m).Run(ctx)
 	stop()
-	if serveErr := <-served; serveErr != nil {
-		log.Warn().Err(serveErr).Msg("metrics listener ended with an error")
-	}
+	<-served
 	return err
 }
 
