@@ -19,6 +19,8 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"github.com/aymaneallaoui/walcast/internal/config"
+	"github.com/aymaneallaoui/walcast/internal/event"
 	"github.com/aymaneallaoui/walcast/internal/metrics"
 	"github.com/aymaneallaoui/walcast/internal/replication"
 )
@@ -141,7 +143,7 @@ func TestBinaryServesMetricsAndKeepsPprofOff(t *testing.T) {
 		body = string(raw)
 		return strings.Contains(body, `walcast_events_delivered_total{op="insert"} 1`)
 	})
-	for _, want := range []string{"walcast_sink_delivery_seconds_hist_bucket{le=", `walcast_sink_delivery_seconds{quantile="0.99"}`, "go_goroutines", "process_resident_memory_bytes"} {
+	for _, want := range []string{"walcast_sink_delivery_seconds_hist_bucket{le=", `walcast_sink_delivery_seconds{quantile="0.99"}`, "go_goroutines", "process_resident_memory_bytes", "walcast_slot_lag_bytes"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("/metrics lacks %s", want)
 		}
@@ -153,5 +155,70 @@ func TestBinaryServesMetricsAndKeepsPprofOff(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("GET /debug/pprof/ = %d without PPROF_ENABLED, want 404", resp.StatusCode)
+	}
+}
+
+// gatedSink holds every batch until it is opened, so the slot cannot advance.
+type gatedSink struct{ open chan struct{} }
+
+func (g *gatedSink) Send(ctx context.Context, _ *event.Batch, done func(error)) {
+	select {
+	case <-g.open:
+		done(nil)
+	case <-ctx.Done():
+		done(ctx.Err())
+	}
+}
+
+func (g *gatedSink) Close() error { return nil }
+
+func TestMetricsReportSlotHealth(t *testing.T) {
+	h := newHarness(t, func(c *config.Config) { c.MetricsAddr = "127.0.0.1:0" })
+	m, snk := metrics.New(), &gatedSink{open: make(chan struct{})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	finished := make(chan error, 1)
+	go func() {
+		_, err := replication.NewRunner(h.cfg, snk, zerolog.Nop()).WithMetrics(m).WithSlotPoll(20 * time.Millisecond).Run(ctx)
+		finished <- err
+	}()
+	t.Cleanup(cancel)
+	scrape := func() string {
+		var out bytes.Buffer
+		m.Write(&out)
+		return out.String()
+	}
+	value := func(series string) float64 {
+		match := regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(series) + ` (\S+)$`).FindStringSubmatch(scrape())
+		if match == nil {
+			return -1
+		}
+		v, _ := strconv.ParseFloat(match[1], 64)
+		return v
+	}
+
+	h.waitFor("the slot to be reported as reserved", func() bool { return value(`walcast_slot_wal_status{status="reserved"}`) == 1 })
+	for _, status := range []string{"extended", "unreserved", "lost"} {
+		if got := value(fmt.Sprintf(`walcast_slot_wal_status{status=%q}`, status)); got != 0 {
+			t.Errorf("wal_status %s = %v, want 0", status, got)
+		}
+	}
+
+	h.exec(fmt.Sprintf("INSERT INTO %s SELECT g, repeat('x', 200), true FROM generate_series(1, 2000) g", h.table))
+	const held = 100_000
+	h.waitFor("lag to show the WAL a stuck sink is holding", func() bool {
+		return value("walcast_slot_lag_bytes") > held && value("walcast_slot_retained_wal_bytes") > held
+	})
+	close(snk.open)
+	h.waitFor("lag to fall once the sink confirms", func() bool { return value("walcast_slot_lag_bytes") < held })
+
+	cancel()
+	select {
+	case err := <-finished:
+		if err != nil {
+			t.Fatalf("Run returned %v", err)
+		}
+	case <-time.After(waitTimeout):
+		t.Fatal("Run did not stop")
 	}
 }

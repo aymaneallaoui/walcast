@@ -2,7 +2,10 @@
 
 package replication
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // EmitMarker runs the worker's marker emit as a server of the given version would, on a session
 // prepared with setup.
@@ -27,4 +30,10 @@ func EnsureBackfillTable(ctx context.Context, databaseURL, schema string) error 
 	}
 	defer func() { _ = conn.Close(context.Background()) }()
 	return ensureBackfillTable(ctx, conn, schema)
+}
+
+// WithSlotPoll shortens the slot health poll so a test does not wait for the default.
+func (r *Runner) WithSlotPoll(every time.Duration) *Runner {
+	r.slotPoll = every
+	return r
 }
