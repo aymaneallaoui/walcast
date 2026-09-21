@@ -43,3 +43,13 @@ func SetTrackedKeysLimit(n int) (restore func()) {
 	trackedKeysLimit = n
 	return func() { trackedKeysLimit = maxTrackedKeys }
 }
+
+// SpendGeneration runs the recreate override's state write the way a starting process does.
+func SpendGeneration(ctx context.Context, databaseURL, schema, slot string, generation int) error {
+	conn, err := connect(ctx, databaseURL)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close(context.Background()) }()
+	return spendGeneration(ctx, conn, schema, slot, generation, true)
+}
