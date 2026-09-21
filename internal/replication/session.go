@@ -74,7 +74,7 @@ func (r *Runner) WithMetrics(m *metrics.Metrics) *Runner {
 	gauge("walcast_inflight_bytes", func(s *session) float64 { return float64(s.ledger.Bytes()) })
 	gauge("walcast_received_lsn", func(s *session) float64 { return float64(s.received.Load()) })
 	gauge("walcast_delivered_lsn", func(s *session) float64 { return float64(s.ledger.Delivered()) })
-	gauge("walcast_reported_lsn", func(s *session) float64 { return float64(s.ledger.Flushed()) })
+	gauge("walcast_reported_lsn", func(s *session) float64 { return float64(s.reported.Load()) })
 	return r
 }
 
@@ -118,14 +118,13 @@ func (r *Runner) Run(ctx context.Context) (pglogrepl.LSN, error) {
 	}
 	r.log.Info().Str("slot", r.cfg.SlotName).Msg("replication started")
 
-	s := newSession(r.cfg, r.log, pgStream{conn})
+	s := newSession(r.cfg, r.log, pgStream{conn}, r.metrics)
 	if backfilling {
 		if s.link, err = newBackfillLink(); err != nil {
 			return 0, err
 		}
 		s.systemID, s.backfilling = systemID, true
 	}
-	s.metrics = r.metrics
 	r.lastDispatch = s.dispatched
 	r.live.Store(s)
 	defer r.live.Store(nil)
@@ -203,6 +202,7 @@ type session struct {
 	// a gauge and is published per sealed batch and per keepalive, which is fresh enough for a scrape.
 	metrics  *metrics.Metrics
 	received atomic.Uint64
+	reported atomic.Uint64
 	walStart pglogrepl.LSN
 }
 
@@ -234,7 +234,7 @@ type awaitedChunk struct {
 	lsn    pglogrepl.LSN
 }
 
-func newSession(cfg config.Config, log zerolog.Logger, st stream) *session {
+func newSession(cfg config.Config, log zerolog.Logger, st stream, m *metrics.Metrics) *session {
 	now := time.Now()
 	enc := event.NewEncoder()
 	enc.IgnoreTables(cfg.StateSchema, stateTable, progressTable)
@@ -244,7 +244,7 @@ func newSession(cfg config.Config, log zerolog.Logger, st stream) *session {
 		stream:        st,
 		ledger:        ledger.New(0),
 		enc:           enc,
-		metrics:       metrics.New(),
+		metrics:       m,
 		queue:         make(chan *event.Batch, queueCap),
 		dispatched:    make(chan struct{}),
 		cur:           event.NewBatch(),
@@ -460,7 +460,7 @@ func (s *session) handleKeepalive(data []byte) error {
 	if !s.inTx && !s.cur.Dirty() {
 		s.ledger.AdvanceIdle(ka.ServerWALEnd)
 	}
-	s.received.Store(uint64(max(s.walStart, ka.ServerWALEnd)))
+	s.publishReceived(max(s.walStart, ka.ServerWALEnd))
 	if ka.ReplyRequested {
 		s.nextFeedback = time.Time{}
 	}
@@ -661,7 +661,7 @@ func (s *session) sealable() bool {
 }
 
 func (s *session) seal() {
-	s.received.Store(uint64(s.walStart))
+	s.publishReceived(s.walStart)
 	s.cur.Seq = s.ledger.Add(s.cur.AckLSN, len(s.cur.Buf))
 	s.pending = s.cur
 	s.cur = event.NewBatch()
@@ -708,7 +708,18 @@ func (s *session) drain(flush bool) bool {
 
 func (s *session) sendStatus() error {
 	silent := time.Since(s.lastServerMsg) > s.cfg.ServerTimeout/2
-	err := s.stream.SendStatus(s.ledger.Flushed(), silent, min(s.cfg.FeedbackInterval, closeTimeout))
+	flushed := s.ledger.Flushed()
+	err := s.stream.SendStatus(flushed, silent, min(s.cfg.FeedbackInterval, closeTimeout))
 	s.nextFeedback = time.Now().Add(s.cfg.FeedbackInterval)
+	if err == nil {
+		s.reported.Store(uint64(flushed))
+	}
 	return err
+}
+
+// publishReceived never moves back: a keepalive can report a position past a batch still lingering.
+func (s *session) publishReceived(lsn pglogrepl.LSN) {
+	if uint64(lsn) > s.received.Load() {
+		s.received.Store(uint64(lsn))
+	}
 }

@@ -10,11 +10,12 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/aymaneallaoui/walcast/internal/event"
+	"github.com/aymaneallaoui/walcast/internal/metrics"
 )
 
 func backfillSession(t *testing.T) *session {
 	t.Helper()
-	s := newSession(testConfig(), zerolog.Nop(), newFakeStream())
+	s := newSession(testConfig(), zerolog.Nop(), newFakeStream(), metrics.New())
 	link, err := newBackfillLink()
 	if err != nil {
 		t.Fatal(err)
@@ -144,7 +145,7 @@ func TestSession_handleMarker(t *testing.T) {
 	})
 
 	t.Run("without a backfill, foreign messages are harmless", func(t *testing.T) {
-		s := newSession(testConfig(), zerolog.Nop(), newFakeStream())
+		s := newSession(testConfig(), zerolog.Nop(), newFakeStream(), metrics.New())
 		s.feed(t, logicalMsg(100, markerPrefix, []byte("not json")), logicalMsg(110, "other", nil))
 		if s.tracker != nil || s.reads != nil {
 			t.Fatal("a logical message changed session state")
