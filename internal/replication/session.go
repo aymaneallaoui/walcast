@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -52,10 +53,13 @@ type Runner struct {
 	// live is the session whose positions the gauges report. They are registered once and read
 	// through it, because every reconnect starts a session with a ledger of its own.
 	live atomic.Pointer[session]
+
+	health   *slotHealth
+	slotPoll time.Duration
 }
 
 func NewRunner(cfg config.Config, snk sink.Sink, log zerolog.Logger) *Runner {
-	return (&Runner{cfg: cfg, sink: snk, log: log}).WithMetrics(metrics.New())
+	return (&Runner{cfg: cfg, sink: snk, log: log, health: newSlotHealth(), slotPoll: defaultSlotPoll}).WithMetrics(metrics.New())
 }
 
 // WithMetrics replaces the private metrics a Runner starts with by the ones the process exposes.
@@ -75,6 +79,16 @@ func (r *Runner) WithMetrics(m *metrics.Metrics) *Runner {
 	gauge("walcast_received_lsn", func(s *session) float64 { return float64(s.received.Load()) })
 	gauge("walcast_delivered_lsn", func(s *session) float64 { return float64(s.ledger.Delivered()) })
 	gauge("walcast_reported_lsn", func(s *session) float64 { return float64(s.reported.Load()) })
+	for _, status := range slotStatuses {
+		m.Gauge(fmt.Sprintf(`walcast_slot_wal_status{status=%q}`, status), func() float64 { return r.health.is(status) })
+	}
+	for name, bits := range map[string]*atomic.Uint64{
+		"walcast_slot_retained_wal_bytes": &r.health.retained,
+		"walcast_slot_lag_bytes":          &r.health.lag,
+		"walcast_slot_safe_wal_bytes":     &r.health.safe,
+	} {
+		m.Gauge(name, func() float64 { return math.Float64frombits(bits.Load()) })
+	}
 	return r
 }
 
@@ -128,6 +142,14 @@ func (r *Runner) Run(ctx context.Context) (pglogrepl.LSN, error) {
 	r.lastDispatch = s.dispatched
 	r.live.Store(s)
 	defer r.live.Store(nil)
+	// The watcher costs a connection, so it only runs for an operator who asked for metrics.
+	if r.cfg.MetricsAddr != "" {
+		watchCtx, stopWatch := context.WithCancel(ctx)
+		var watching sync.WaitGroup
+		watching.Go(func() { watchSlot(watchCtx, r.cfg.DatabaseURL, r.cfg.SlotName, r.slotPoll, r.health, r.log) })
+		defer watching.Wait()
+		defer stopWatch()
+	}
 	return s.run(ctx, r.sink)
 }
 
