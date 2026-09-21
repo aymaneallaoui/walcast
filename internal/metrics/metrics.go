@@ -21,8 +21,10 @@ type latency struct {
 	histogram *vm.PrometheusHistogram
 }
 
+// Observe clamps at zero: a source clock ahead of ours gives a negative age, which the histogram
+// would drop and the summary keep, and the two must agree.
 func (l latency) Observe(d time.Duration) {
-	seconds := d.Seconds()
+	seconds := max(0, d.Seconds())
 	l.summary.Update(seconds)
 	l.histogram.Update(seconds)
 }
