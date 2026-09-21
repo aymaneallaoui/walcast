@@ -122,17 +122,33 @@ type backfillProgress struct {
 }
 
 // ensureBackfillTable follows ensureStateTable: no DDL once the table exists, so it can be
-// provisioned ahead of time for a role without CREATE.
-func ensureBackfillTable(ctx context.Context, conn *pgconn.PgConn, schema string) error {
-	rows, err := queryParams(ctx, conn, "SELECT to_regclass($1) IS NOT NULL", schema+"."+progressTable)
+// provisioned ahead of time for a role without CREATE. Progress is per slot: two pipelines may copy
+// one table to different destinations, and a table made before that was known is rekeyed once.
+func ensureBackfillTable(ctx context.Context, conn *pgconn.PgConn, schema, slot string) error {
+	rows, err := queryParams(ctx, conn, `
+SELECT to_regclass($1) IS NOT NULL,
+       EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass($1) AND attname = 'slot_name' AND NOT attisdropped)`,
+		schema+"."+progressTable)
 	if err != nil {
 		return stateError("inspect backfill table", err)
 	}
-	if len(rows) == 1 && string(rows[0][0]) == "t" {
+	exists, perSlot := len(rows) == 1 && string(rows[0][0]) == "t", len(rows) == 1 && string(rows[0][1]) == "t"
+	switch {
+	case exists && perSlot:
+		return nil
+	case exists:
+		ddl := fmt.Sprintf(`ALTER TABLE %[1]s.%[2]s ADD COLUMN slot_name text NOT NULL DEFAULT '%[3]s';
+ALTER TABLE %[1]s.%[2]s ALTER COLUMN slot_name DROP DEFAULT;
+ALTER TABLE %[1]s.%[2]s DROP CONSTRAINT %[2]s_pkey;
+ALTER TABLE %[1]s.%[2]s ADD PRIMARY KEY (slot_name, table_name)`, schema, progressTable, slot)
+		if _, err := conn.Exec(ctx, ddl).ReadAll(); err != nil {
+			return stateError("rekey backfill table by slot", err)
+		}
 		return nil
 	}
 	ddl := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s.%s (
-	table_name      text PRIMARY KEY,
+	slot_name       text NOT NULL,
+	table_name      text NOT NULL,
 	table_oid       oid NOT NULL,
 	slot_generation integer NOT NULL,
 	status          text NOT NULL,
@@ -141,7 +157,8 @@ func ensureBackfillTable(ctx context.Context, conn *pgconn.PgConn, schema string
 	pending_keys    text,
 	rows_emitted    bigint NOT NULL DEFAULT 0,
 	started_at      timestamptz NOT NULL DEFAULT now(),
-	finished_at     timestamptz
+	finished_at     timestamptz,
+	PRIMARY KEY (slot_name, table_name)
 )`, schema, progressTable)
 	if _, err := conn.Exec(ctx, ddl).ReadAll(); err != nil {
 		return stateError("create backfill table", err)
@@ -151,21 +168,21 @@ func ensureBackfillTable(ctx context.Context, conn *pgconn.PgConn, schema string
 
 // loadBackfill starts over when the saved progress describes another table incarnation or another
 // slot generation: a recreated table has new rows, and an accepted slot gap has to be repaired.
-func loadBackfill(ctx context.Context, conn *pgconn.PgConn, schema string, table backfillTable, slotGeneration uint64) (backfillProgress, error) {
+func loadBackfill(ctx context.Context, conn *pgconn.PgConn, schema, slot string, table backfillTable, slotGeneration uint64) (backfillProgress, error) {
 	name, oid, generation := table.qualified(), strconv.FormatUint(uint64(table.oid), 10), strconv.FormatUint(slotGeneration, 10)
 	_, err := queryParams(ctx, conn, fmt.Sprintf(`
-INSERT INTO %[1]s.%[2]s AS b (table_name, table_oid, slot_generation, status) VALUES ($1, $2::oid, $3::int, $4)
-ON CONFLICT (table_name) DO UPDATE
+INSERT INTO %[1]s.%[2]s AS b (table_name, table_oid, slot_generation, status, slot_name) VALUES ($1, $2::oid, $3::int, $4, $5)
+ON CONFLICT (slot_name, table_name) DO UPDATE
 SET table_oid = EXCLUDED.table_oid, slot_generation = EXCLUDED.slot_generation, status = EXCLUDED.status,
     upper_key = NULL, last_key = NULL, pending_keys = NULL, rows_emitted = 0, started_at = now(), finished_at = NULL
 WHERE b.table_oid <> EXCLUDED.table_oid OR b.slot_generation <> EXCLUDED.slot_generation`, schema, progressTable),
-		name, oid, generation, backfillRunning)
+		name, oid, generation, backfillRunning, slot)
 	if err != nil {
 		return backfillProgress{}, stateError("register backfill", err)
 	}
 
 	rows, err := queryParams(ctx, conn, fmt.Sprintf(
-		"SELECT status, upper_key, last_key, rows_emitted::text, pending_keys FROM %s.%s WHERE table_name = $1", schema, progressTable), name)
+		"SELECT status, upper_key, last_key, rows_emitted::text, pending_keys FROM %s.%s WHERE table_name = $1 AND slot_name = $2", schema, progressTable), name, slot)
 	if err != nil {
 		return backfillProgress{}, stateError("read backfill progress", err)
 	}
@@ -192,59 +209,59 @@ WHERE b.table_oid <> EXCLUDED.table_oid OR b.slot_generation <> EXCLUDED.slot_ge
 
 // parkPendingKey appends to the row of a table that is still being copied; with no such row the
 // statement changes nothing, which is what a table that has not started needs.
-func parkPendingKey(ctx context.Context, conn *pgconn.PgConn, schema, table string, key []string) error {
+func parkPendingKey(ctx context.Context, conn *pgconn.PgConn, schema, slot, table string, key []string) error {
 	encoded, err := json.Marshal([][]string{key})
 	if err != nil {
 		return fmt.Errorf("encode pending key: %w", err)
 	}
 	_, err = queryParams(ctx, conn, fmt.Sprintf(
-		"UPDATE %s.%s SET pending_keys = (COALESCE(pending_keys, '[]')::jsonb || $2::jsonb)::text WHERE table_name = $1 AND status <> $3",
-		schema, progressTable), table, string(encoded), backfillDone)
+		"UPDATE %s.%s SET pending_keys = (COALESCE(pending_keys, '[]')::jsonb || $2::jsonb)::text WHERE table_name = $1 AND status <> $3 AND slot_name = $4",
+		schema, progressTable), table, string(encoded), backfillDone, slot)
 	if err != nil {
 		return stateError("park key move", err)
 	}
 	return nil
 }
 
-func clearPendingKeys(ctx context.Context, conn *pgconn.PgConn, schema string, table backfillTable) error {
-	_, err := queryParams(ctx, conn, fmt.Sprintf("UPDATE %s.%s SET pending_keys = NULL WHERE table_name = $1", schema, progressTable), table.qualified())
+func clearPendingKeys(ctx context.Context, conn *pgconn.PgConn, schema, slot string, table backfillTable) error {
+	_, err := queryParams(ctx, conn, fmt.Sprintf("UPDATE %s.%s SET pending_keys = NULL WHERE table_name = $1 AND slot_name = $2", schema, progressTable), table.qualified(), slot)
 	if err != nil {
 		return stateError("clear pending keys", err)
 	}
 	return nil
 }
 
-func saveBackfillUpper(ctx context.Context, conn *pgconn.PgConn, schema string, table backfillTable, upper []string) error {
+func saveBackfillUpper(ctx context.Context, conn *pgconn.PgConn, schema, slot string, table backfillTable, upper []string) error {
 	encoded, err := json.Marshal(upper)
 	if err != nil {
 		return fmt.Errorf("encode upper key: %w", err)
 	}
-	_, err = queryParams(ctx, conn, fmt.Sprintf("UPDATE %s.%s SET upper_key = $2 WHERE table_name = $1", schema, progressTable),
-		table.qualified(), string(encoded))
+	_, err = queryParams(ctx, conn, fmt.Sprintf("UPDATE %s.%s SET upper_key = $2 WHERE table_name = $1 AND slot_name = $3", schema, progressTable),
+		table.qualified(), string(encoded), slot)
 	if err != nil {
 		return stateError("save backfill upper key", err)
 	}
 	return nil
 }
 
-func saveBackfillProgress(ctx context.Context, conn *pgconn.PgConn, schema string, table backfillTable, progress backfillProgress) error {
+func saveBackfillProgress(ctx context.Context, conn *pgconn.PgConn, schema, slot string, table backfillTable, progress backfillProgress) error {
 	encoded, err := json.Marshal(progress.last)
 	if err != nil {
 		return fmt.Errorf("encode last key: %w", err)
 	}
 	_, err = queryParams(ctx, conn, fmt.Sprintf(
-		"UPDATE %s.%s SET last_key = $2, rows_emitted = $3::bigint WHERE table_name = $1", schema, progressTable),
-		table.qualified(), string(encoded), strconv.FormatInt(progress.rows, 10))
+		"UPDATE %s.%s SET last_key = $2, rows_emitted = $3::bigint WHERE table_name = $1 AND slot_name = $4", schema, progressTable),
+		table.qualified(), string(encoded), strconv.FormatInt(progress.rows, 10), slot)
 	if err != nil {
 		return stateError("save backfill progress", err)
 	}
 	return nil
 }
 
-func finishBackfill(ctx context.Context, conn *pgconn.PgConn, schema string, table backfillTable) error {
+func finishBackfill(ctx context.Context, conn *pgconn.PgConn, schema, slot string, table backfillTable) error {
 	_, err := queryParams(ctx, conn, fmt.Sprintf(
-		"UPDATE %s.%s SET status = $2, finished_at = now() WHERE table_name = $1", schema, progressTable),
-		table.qualified(), backfillDone)
+		"UPDATE %s.%s SET status = $2, finished_at = now() WHERE table_name = $1 AND slot_name = $3", schema, progressTable),
+		table.qualified(), backfillDone, slot)
 	if err != nil {
 		return stateError("finish backfill", err)
 	}

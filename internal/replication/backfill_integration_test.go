@@ -34,7 +34,7 @@ func (h *harness) backfillStatus() (status string, rows int) {
 	if exists := h.exec(fmt.Sprintf("SELECT to_regclass('%s.backfills') IS NOT NULL", h.cfg.StateSchema)); string(exists[0][0]) != "t" {
 		return "", 0
 	}
-	got := h.exec(fmt.Sprintf("SELECT status, rows_emitted FROM %s.backfills WHERE table_name = 'public.%s'", h.cfg.StateSchema, h.table))
+	got := h.exec(fmt.Sprintf("SELECT status, rows_emitted FROM %s.backfills WHERE table_name = 'public.%s' AND slot_name = '%s'", h.cfg.StateSchema, h.table, h.cfg.SlotName))
 	if len(got) != 1 {
 		return "", 0
 	}
@@ -403,12 +403,12 @@ func TestBackfillReadsParkedKeysBeforeResumingTheScan(t *testing.T) {
 	h.exec(fmt.Sprintf("INSERT INTO %s SELECT g, 'seed ' || g, true FROM generate_series(1, 20) g", h.table))
 	h.startSession()()
 	backfillOf(100, 1<<20)(&h.cfg)
-	if err := replication.EnsureBackfillTable(context.Background(), h.cfg.DatabaseURL, h.cfg.StateSchema); err != nil {
+	if err := replication.EnsureBackfillTable(context.Background(), h.cfg.DatabaseURL, h.cfg.StateSchema, h.cfg.SlotName); err != nil {
 		t.Fatal(err)
 	}
 
-	h.exec(fmt.Sprintf(`INSERT INTO %s.backfills (table_name, table_oid, slot_generation, status, upper_key, last_key, pending_keys)
-VALUES ('public.%s', 'public.%s'::regclass::oid, 0, 'running', '["20"]', '["10"]', '[["5"]]')`, h.cfg.StateSchema, h.table, h.table))
+	h.exec(fmt.Sprintf(`INSERT INTO %s.backfills (slot_name, table_name, table_oid, slot_generation, status, upper_key, last_key, pending_keys)
+VALUES ('%s', 'public.%s', 'public.%s'::regclass::oid, 0, 'running', '["20"]', '["10"]', '[["5"]]')`, h.cfg.StateSchema, h.cfg.SlotName, h.table, h.table))
 
 	stop := h.startSession()
 	h.waitFor("backfill to be marked done", func() bool { status, _ := h.backfillStatus(); return status == "done" })
@@ -424,7 +424,7 @@ VALUES ('public.%s', 'public.%s'::regclass::oid, 0, 'running', '["20"]', '["10"]
 	if len(ids) != 11 || ids[0] != 5 || ids[1] != 11 || ids[10] != 20 {
 		t.Fatalf("read ids = %v, want the parked row 5 first and then the scan from 11 to 20", ids)
 	}
-	if got := h.exec(fmt.Sprintf("SELECT pending_keys IS NULL FROM %s.backfills WHERE table_name = 'public.%s'", h.cfg.StateSchema, h.table)); string(got[0][0]) != "t" {
+	if got := h.exec(fmt.Sprintf("SELECT pending_keys IS NULL FROM %s.backfills WHERE table_name = 'public.%s' AND slot_name = '%s'", h.cfg.StateSchema, h.table, h.cfg.SlotName)); string(got[0][0]) != "t" {
 		t.Fatal("parked keys were not cleared after they were read")
 	}
 }
@@ -482,4 +482,23 @@ func TestBackfillMarkerIsFlushedWhenCommitsAreAsynchronous(t *testing.T) {
 			t.Fatalf("server %d: marker written after %s was not flushed when emit returned", version, before)
 		}
 	}
+}
+
+// Two pipelines can copy the same table to different destinations. Progress saved by one must not
+// make the other believe its destination already has the rows.
+func TestBackfillProgressBelongsToOneSlot(t *testing.T) {
+	h := newHarness(t, backfillOf(100, 1<<20))
+	h.addToastColumn()
+	h.seed(5)
+	stop := h.startSession()
+	h.waitFor("the first pipeline to finish its backfill", func() bool { status, _ := h.backfillStatus(); return status == "done" })
+	stop()
+
+	other := *h
+	other.cfg.SlotName = h.cfg.SlotName + "_b"
+	other.sink = &captureSink{}
+	t.Cleanup(other.dropSlot)
+	stop = other.startSession()
+	other.waitFor("the second pipeline to read every row for its own destination", func() bool { return other.reads() == 5 })
+	stop()
 }
