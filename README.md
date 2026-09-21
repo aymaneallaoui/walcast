@@ -109,6 +109,8 @@ A 2xx response means the batch is safely stored on your side: only then is its L
 
 Set `METRICS_ADDR` (for example `127.0.0.1:9090`) to serve Prometheus metrics on `/metrics`. Nothing listens unless it is set. `PPROF_ENABLED=true` adds `/debug/pprof/` to the same listener; it exposes process internals and can be used to load the process, so keep it on loopback, and walcast warns when it is not.
 
+With metrics on, walcast opens one more ordinary connection and reads `pg_replication_slots` every 15 seconds for the slot metrics. It needs no extra privilege, and a failed check is logged and retried without touching the stream.
+
 | Metric | Meaning |
 | --- | --- |
 | `walcast_events_delivered_total{op}` | events the sink confirmed, by `insert`, `update`, `delete`, `truncate`, `read` |
@@ -119,6 +121,8 @@ Set `METRICS_ADDR` (for example `127.0.0.1:9090`) to serve Prometheus metrics on
 | `walcast_end_to_end_seconds` | from the oldest commit in a batch to its delivery, so no event in the batch waited longer |
 | `walcast_received_lsn`, `walcast_delivered_lsn`, `walcast_reported_lsn` | stream positions; reported is the last position Postgres was actually sent, received minus reported is the backlog in WAL bytes, and reported stays behind delivered until the next feedback or while an ack is held back |
 | `walcast_inflight_batches`, `walcast_inflight_bytes` | batches the ledger still holds and the bytes the sink has not confirmed; a confirmed batch stays in the count until every batch before it is confirmed too |
+| `walcast_slot_wal_status{status}` | 1 for the slot's current `wal_status` (`reserved`, `extended`, `unreserved`, `lost`), 0 for the others; alert on `unreserved` |
+| `walcast_slot_retained_wal_bytes`, `walcast_slot_lag_bytes`, `walcast_slot_safe_wal_bytes` | WAL the slot keeps on the server, WAL written since the position Postgres has confirmed, and what may still be written before the slot is lost; `NaN` when not known, as with no `max_slot_wal_keep_size` |
 | `walcast_streaming`, `walcast_reconnects_total` | 1 while a session is up, and how often one had to be restarted |
 | `walcast_backfill_rows_total`, `walcast_backfill_chunks_total` | backfill progress |
 | `walcast_backfill_rows_superseded_total`, `walcast_backfill_rows_reread_total` | chunk rows dropped because the stream had a newer complete image, and rows read again |
