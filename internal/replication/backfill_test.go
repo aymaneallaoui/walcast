@@ -198,6 +198,9 @@ func TestKeyValues(t *testing.T) {
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
 			}
+			if err != nil && strings.Contains(err.Error(), `"id":1`) {
+				t.Fatalf("error carries the row key, which can be personal data and ends up in logs: %v", err)
+			}
 			if !tt.wantErr && strings.Join(got, "|") != strings.Join(tt.want, "|") {
 				t.Fatalf("values = %q, want %q", got, tt.want)
 			}
