@@ -299,7 +299,8 @@ WHERE p.pubname = $1 AND pr.prrelid = $2::oid AND (pr.prqual IS NOT NULL OR pr.p
 
 	table := backfillTable{schema: schema, name: name, oid: uint32(oid)}
 	cols, err := w.query(ctx, `
-SELECT a.attname, a.atttypid::text, i.indkey IS NOT NULL AND a.attnum = ANY (i.indkey)
+SELECT a.attname, a.atttypid::text,
+       EXISTS (SELECT 1 FROM unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord) WHERE k.attnum = a.attnum AND k.ord <= i.indnkeyatts)
 FROM pg_attribute a
 LEFT JOIN pg_index i ON i.indrelid = a.attrelid AND i.indisprimary
 WHERE a.attrelid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped AND a.attgenerated = ''
@@ -319,7 +320,7 @@ SELECT a.attname
 FROM pg_index i
 CROSS JOIN LATERAL unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
 JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
-WHERE i.indrelid = $1::oid AND i.indisprimary
+WHERE i.indrelid = $1::oid AND i.indisprimary AND k.ord <= i.indnkeyatts
 ORDER BY k.ord`, string(row[0]))
 	if err != nil {
 		return backfillTable{}, fmt.Errorf("inspect %s: primary key: %w", qualifiedName, err)
@@ -716,7 +717,7 @@ SELECT a.attname FROM pg_index i
 CROSS JOIN LATERAL unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
 JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
 JOIN pg_class c ON c.oid = i.indrelid JOIN pg_namespace n ON n.oid = c.relnamespace
-WHERE n.nspname = $1 AND c.relname = $2 AND i.indisprimary ORDER BY k.ord`, schema, name)
+WHERE n.nspname = $1 AND c.relname = $2 AND i.indisprimary AND k.ord <= i.indnkeyatts ORDER BY k.ord`, schema, name)
 	if err != nil {
 		return fmt.Errorf("park key move of %s: %w", move.table, err)
 	}

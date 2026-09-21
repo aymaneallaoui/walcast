@@ -643,3 +643,21 @@ func TestBackfillKeepsOwedRereadsAcrossATrackerReset(t *testing.T) {
 		t.Fatalf("consumer holds %d rows, table has %d", len(got), len(want))
 	}
 }
+
+// An INCLUDE column sits in the primary key's index but is not part of the row's identity: the
+// stream keys rows without it, so the scan must too, and it may be null.
+func TestBackfillKeysRowsByTheIdentityNotByIncludedColumns(t *testing.T) {
+	h := newHarness(t, backfillOf(100, 1<<20))
+	h.exec(fmt.Sprintf("ALTER TABLE %[1]s DROP CONSTRAINT %[1]s_pkey, ADD PRIMARY KEY (id) INCLUDE (name)", h.table))
+	h.exec(fmt.Sprintf("INSERT INTO %s VALUES (1, NULL, true), (2, 'named', true)", h.table))
+
+	stop := h.startSession()
+	h.waitFor("backfill to be marked done", func() bool { status, _ := h.backfillStatus(); return status == "done" })
+	h.exec(fmt.Sprintf("UPDATE %s SET id = 3 WHERE id = 2", h.table))
+	h.waitFor("the key change to arrive as a delete and an insert", func() bool { return h.sink.count() >= 4 })
+	stop()
+
+	if h.reads() != 2 {
+		t.Fatalf("read %d rows, want 2", h.reads())
+	}
+}
