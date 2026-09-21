@@ -240,13 +240,19 @@ func (w *backfillWorker) tableNames(ctx context.Context) ([]string, error) {
 		}
 		return names, nil
 	}
-	rows, err := w.query(ctx, "SELECT schemaname || '.' || tablename FROM pg_publication_tables WHERE pubname = $1 ORDER BY 1", w.cfg.PublicationName)
+	rows, err := w.query(ctx, "SELECT schemaname, tablename FROM pg_publication_tables WHERE pubname = $1 ORDER BY 1, 2", w.cfg.PublicationName)
 	if err != nil {
 		return nil, fmt.Errorf("list publication tables: %w", err)
 	}
 	var names []string
 	for _, row := range rows {
-		if name := string(row[0]); !slices.Contains(own, name) {
+		schema, table := string(row[0]), string(row[1])
+		// schema.table is how a table is named everywhere from here on, and a dot inside either
+		// part would make two tables share one name, one progress row and one tracker.
+		if strings.Contains(schema, ".") || strings.Contains(table, ".") {
+			return nil, fmt.Errorf("%w: %q.%q has a dot in its name, which schema.table cannot tell apart from another table", ErrBackfillRefused, schema, table)
+		}
+		if name := schema + "." + table; !slices.Contains(own, name) {
 			names = append(names, name)
 		}
 	}

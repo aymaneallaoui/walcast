@@ -16,6 +16,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/rs/zerolog"
+
 	"github.com/aymaneallaoui/walcast/internal/config"
 	"github.com/aymaneallaoui/walcast/internal/replication"
 )
@@ -662,5 +664,21 @@ func TestBackfillKeysRowsByTheIdentityNotByIncludedColumns(t *testing.T) {
 
 	if h.reads() != 2 {
 		t.Fatalf("read %d rows, want 2", h.reads())
+	}
+}
+
+func TestBackfillAllRefusesATableNameWithADot(t *testing.T) {
+	h := newHarness(t, func(c *config.Config) {
+		c.PublicationTables = nil
+		c.BackfillTables = []string{config.BackfillAll}
+		c.BackfillChunkRows, c.BackfillChunkBytes = 100, 1<<20
+	})
+	dotted := fmt.Sprintf(`"walcast.dotted_%d"`, time.Now().UnixNano())
+	h.exec(fmt.Sprintf("CREATE TABLE %s (id bigint PRIMARY KEY)", dotted))
+	t.Cleanup(func() { h.exec("DROP TABLE " + dotted) })
+
+	_, err := replication.NewRunner(h.cfg, h.sink, zerolog.Nop()).Run(context.Background())
+	if !errors.Is(err, replication.ErrBackfillRefused) || !strings.Contains(err.Error(), "dot") {
+		t.Fatalf("Run returned %v, want the dotted table refused", err)
 	}
 }
