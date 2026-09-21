@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 
@@ -212,4 +213,25 @@ func TestProvisionedStateTableNeedsNoCreatePrivilege(t *testing.T) {
 	h.exec(fmt.Sprintf("INSERT INTO %s VALUES (1, 'low privilege', true)", h.table))
 	h.waitFor("event delivered by the low-privilege role", func() bool { return h.sink.count() >= 1 })
 	stop()
+}
+
+func TestBackfillTableMadeBeforeSlotsIsRekeyed(t *testing.T) {
+	h := newHarness(t, nil)
+	schema := fmt.Sprintf("walcast_rekey_%d", time.Now().UnixNano())
+	h.exec(fmt.Sprintf(`CREATE SCHEMA %[1]s; CREATE TABLE %[1]s.backfills (
+	table_name text PRIMARY KEY, table_oid oid NOT NULL, slot_generation integer NOT NULL, status text NOT NULL,
+	upper_key text, last_key text, pending_keys text, rows_emitted bigint NOT NULL DEFAULT 0,
+	started_at timestamptz NOT NULL DEFAULT now(), finished_at timestamptz);
+INSERT INTO %[1]s.backfills (table_name, table_oid, slot_generation, status) VALUES ('public.users', 1, 0, 'done')`, schema))
+	t.Cleanup(func() { h.exec(fmt.Sprintf("DROP SCHEMA %s CASCADE", schema)) })
+
+	for range 2 {
+		if err := replication.EnsureBackfillTable(context.Background(), h.cfg.DatabaseURL, schema, "first_slot"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := h.exec(fmt.Sprintf("SELECT slot_name FROM %s.backfills WHERE table_name = 'public.users'", schema)); len(got) != 1 || string(got[0][0]) != "first_slot" {
+		t.Fatalf("existing progress now belongs to %v, want the slot that made it", got)
+	}
+	h.exec(fmt.Sprintf("INSERT INTO %s.backfills (slot_name, table_name, table_oid, slot_generation, status) VALUES ('second_slot', 'public.users', 1, 0, 'running')", schema))
 }

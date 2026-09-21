@@ -160,7 +160,7 @@ func (w *backfillWorker) run(ctx context.Context) error {
 	if err := w.checkSource(ctx); err != nil {
 		return err
 	}
-	if err := ensureBackfillTable(ctx, w.conn, w.cfg.StateSchema); err != nil {
+	if err := ensureBackfillTable(ctx, w.conn, w.cfg.StateSchema, w.cfg.SlotName); err != nil {
 		return err
 	}
 	slotGeneration, err := w.scalar(ctx, fmt.Sprintf("SELECT generation FROM %s.%s WHERE slot_name = $1", w.cfg.StateSchema, stateTable), w.cfg.SlotName)
@@ -178,7 +178,7 @@ func (w *backfillWorker) run(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		progress, err := loadBackfill(ctx, w.conn, w.cfg.StateSchema, table, slotGeneration)
+		progress, err := loadBackfill(ctx, w.conn, w.cfg.StateSchema, w.cfg.SlotName, table, slotGeneration)
 		if err != nil {
 			return err
 		}
@@ -340,10 +340,10 @@ func (w *backfillWorker) backfill(ctx context.Context, table backfillTable, prog
 		}
 		if upper == nil {
 			w.log.Info().Str("table", table.qualified()).Msg("backfill: table is empty")
-			return finishBackfill(ctx, w.conn, w.cfg.StateSchema, table)
+			return finishBackfill(ctx, w.conn, w.cfg.StateSchema, w.cfg.SlotName, table)
 		}
 		progress.upper = upper
-		if err := saveBackfillUpper(ctx, w.conn, w.cfg.StateSchema, table, upper); err != nil {
+		if err := saveBackfillUpper(ctx, w.conn, w.cfg.StateSchema, w.cfg.SlotName, table, upper); err != nil {
 			return err
 		}
 	}
@@ -364,7 +364,7 @@ func (w *backfillWorker) backfill(ctx context.Context, table backfillTable, prog
 			return fmt.Errorf("key tracker was reset while reading parked keys of %s", table.qualified())
 		}
 		progress.rows += int64(emitted)
-		if err := clearPendingKeys(ctx, w.conn, w.cfg.StateSchema, table); err != nil {
+		if err := clearPendingKeys(ctx, w.conn, w.cfg.StateSchema, w.cfg.SlotName, table); err != nil {
 			return err
 		}
 	}
@@ -391,12 +391,12 @@ func (w *backfillWorker) backfill(ctx context.Context, table backfillTable, prog
 			break
 		}
 		progress.last, progress.rows = last, progress.rows+int64(emitted)
-		if err := saveBackfillProgress(ctx, w.conn, w.cfg.StateSchema, table, progress); err != nil {
+		if err := saveBackfillProgress(ctx, w.conn, w.cfg.StateSchema, w.cfg.SlotName, table, progress); err != nil {
 			return err
 		}
 	}
 	w.log.Info().Str("table", table.qualified()).Int64("rows", progress.rows).Msg("backfill finished")
-	return finishBackfill(ctx, w.conn, w.cfg.StateSchema, table)
+	return finishBackfill(ctx, w.conn, w.cfg.StateSchema, w.cfg.SlotName, table)
 }
 
 // deliver hands a chunk to the stream, then reads again every key that came back unresolved: rows
@@ -706,7 +706,7 @@ WHERE n.nspname = $1 AND c.relname = $2 AND i.indisprimary ORDER BY k.ord`, sche
 	if err != nil {
 		return err
 	}
-	return parkPendingKey(ctx, w.conn, w.cfg.StateSchema, move.table, key)
+	return parkPendingKey(ctx, w.conn, w.cfg.StateSchema, w.cfg.SlotName, move.table, key)
 }
 
 func flatten(rows [][][]byte) [][]byte {

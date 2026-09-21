@@ -31,7 +31,8 @@ CREATE TABLE walcast_state.slots (
     recreated_at timestamptz
 );
 CREATE TABLE walcast_state.backfills (
-    table_name      text PRIMARY KEY,
+    slot_name       text NOT NULL,
+    table_name      text NOT NULL,
     table_oid       oid NOT NULL,
     slot_generation integer NOT NULL,
     status          text NOT NULL,
@@ -40,9 +41,12 @@ CREATE TABLE walcast_state.backfills (
     pending_keys    text,
     rows_emitted    bigint NOT NULL DEFAULT 0,
     started_at      timestamptz NOT NULL DEFAULT now(),
-    finished_at     timestamptz
+    finished_at     timestamptz,
+    PRIMARY KEY (slot_name, table_name)
 );
 ```
+
+Backfill progress belongs to a slot, so two pipelines can copy one table to different destinations. A `backfills` table made before progress was kept per slot is rekeyed on the next start, which needs ownership of the table.
 
 Anyone who can write to this table can switch the protection off, so grant it to the walcast role only.
 
