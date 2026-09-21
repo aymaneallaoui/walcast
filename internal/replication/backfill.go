@@ -174,7 +174,7 @@ func (w *backfillWorker) run(ctx context.Context) error {
 	if err := w.checkSource(ctx); err != nil {
 		return err
 	}
-	if err := ensureBackfillTable(ctx, w.conn, w.cfg.StateSchema, w.cfg.SlotName); err != nil {
+	if err := ensureBackfillTable(ctx, w.conn, w.cfg.StateSchema); err != nil {
 		return err
 	}
 	slotGeneration, err := w.scalar(ctx, fmt.Sprintf("SELECT generation FROM %s.%s WHERE slot_name = $1", w.cfg.StateSchema, stateTable), w.cfg.SlotName)

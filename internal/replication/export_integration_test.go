@@ -23,13 +23,13 @@ func EmitMarker(ctx context.Context, databaseURL string, serverVersion uint64, s
 }
 
 // EnsureBackfillTable lets a test seed progress without depending on an earlier test's backfill.
-func EnsureBackfillTable(ctx context.Context, databaseURL, schema, slot string) error {
+func EnsureBackfillTable(ctx context.Context, databaseURL, schema string) error {
 	conn, err := connectSQL(ctx, databaseURL)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = conn.Close(context.Background()) }()
-	return ensureBackfillTable(ctx, conn, schema, slot)
+	return ensureBackfillTable(ctx, conn, schema)
 }
 
 // WithSlotPoll shortens the slot health poll so a test does not wait for the default.
