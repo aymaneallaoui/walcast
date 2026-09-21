@@ -192,6 +192,9 @@ func TestSession_handleXLogData(t *testing.T) {
 		if s.pending == nil || s.pending.AckLSN != 0 || s.ledger.Depth() != 1 {
 			t.Fatalf("pending=%v depth=%d", s.pending, s.ledger.Depth())
 		}
+		if s.pending.CommitNanos == 0 {
+			t.Fatal("fragment carries no commit time, so its delivery would never be measured end to end")
+		}
 	})
 
 	t.Run("empty transaction advances the idle ledger directly", func(t *testing.T) {
