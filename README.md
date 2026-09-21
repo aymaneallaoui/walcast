@@ -62,7 +62,7 @@ One JSON object per line:
 - An update that changes the row's replica identity (its primary key) is emitted as a `delete` of the old key followed by an `insert` of the new one, both carrying `"origin":"update"`. Every key's history then stays self-consistent for consumers partitioned by key.
 - `commit_lsn` + `seq` identify an event; use them to deduplicate.
 - A `read` event carries the whole row in `new` and is an upsert. It has `backfill` + `seq` instead of `commit_lsn` and `txid`; `backfill` is the table's OID and the chunk's marker LSN, so it is unique per delivered chunk, also across restarts: a chunk is positioned at a marker in the WAL, and a marker's LSN can equal the `commit_lsn` of the next transaction, so the two must not share an id space. A repeated `read` is harmless to apply again. Its `ts` is when the chunk was read, not a commit time.
-- The `insert` half of a key change can list `unchanged` columns. Take them from the row the preceding `delete` removed. During a backfill walcast sends such a row again as a `read`, so a consumer that started empty still gets every column.
+- The `insert` half of a key change can list `unchanged` columns. Take them from the row the preceding `delete` removed. During a backfill walcast sends such a row again as a `read`, so a consumer that started empty still gets every column. With Kafka the two halves are keyed differently and can land on different partitions, so a consumer that only sees one partition cannot take the columns from the `delete`: it needs a store shared across partitions, or a table whose primary key is never updated.
 - `old` holds the replica identity columns only, or the full row with `REPLICA IDENTITY FULL`.
 - `unchanged` lists TOASTed columns Postgres did not resend. They are absent from `new`, not null.
 - Both connections pin `TimeZone=UTC`, `DateStyle`, `IntervalStyle`, `extra_float_digits` and `bytea_output`, so a value renders the same in a streamed event and in a `read`. `timestamptz` values are therefore in UTC.
@@ -147,7 +147,7 @@ Read from the environment. A `.env` file is loaded if present and never override
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `DATABASE_URL` | required | Postgres connection string, user needs `REPLICATION` |
+| `DATABASE_URL` | required | Postgres connection string, user needs `REPLICATION`. walcast does not force TLS here as it does for the webhook and Kafka: the default `sslmode=prefer` can be downgraded, so use `sslmode=verify-full` for any server that is not on loopback. Removed from the process environment once read, like `WEBHOOK_SECRET` and `KAFKA_SASL_PASSWORD` |
 | `SLOT_NAME` | `walcast_slot` | lowercase letters, digits, underscore |
 | `PUBLICATION_NAME` | `walcast_pub` | same charset |
 | `PUBLICATION_TABLES` | all tables | comma separated `schema.table`; all tables needs superuser |
