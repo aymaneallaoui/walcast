@@ -502,3 +502,144 @@ func TestBackfillProgressBelongsToOneSlot(t *testing.T) {
 	other.waitFor("the second pipeline to read every row for its own destination", func() bool { return other.reads() == 5 })
 	stop()
 }
+
+// A key move made after tracking began is decoded while its new row is still invisible to every
+// query. Reading that key again then finds nothing, which must not be taken for a deleted row.
+func TestBackfillRereadsAMovedRowOnlyOnceItIsVisible(t *testing.T) {
+	const seeded, movedFrom, movedTo = 2000, 1990, 99999
+	h := newHarness(t, nil)
+	if string(h.exec("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")[0][0]) != "t" {
+		t.Skip("needs a superuser to change synchronous_standby_names")
+	}
+	h.addToastColumn()
+	h.seed(seeded)
+	h.startSession()()
+	backfillOf(1, 1<<20)(&h.cfg)
+	h.cfg.DatabaseURL += "&options=-csynchronous_commit%3Dlocal"
+
+	writer, err := pgconn.Connect(context.Background(), os.Getenv("DATABASE_URL"))
+	if err != nil {
+		t.Fatalf("connect writer: %v", err)
+	}
+	h.exec("ALTER SYSTEM SET synchronous_standby_names = 'walcast_missing_standby'")
+	h.exec("SELECT pg_reload_conf()")
+	t.Cleanup(func() {
+		h.exec("ALTER SYSTEM RESET synchronous_standby_names")
+		h.exec("SELECT pg_reload_conf()")
+		_ = writer.Close(context.Background())
+	})
+	h.waitFor("the standby setting to load", func() bool {
+		return string(h.exec("SHOW synchronous_standby_names")[0][0]) != ""
+	})
+
+	stop := h.startSession()
+	h.waitFor("the scan to be under way", func() bool { return h.reads() >= 5 })
+	committed := make(chan error, 1)
+	go func() {
+		_, err := writer.Exec(context.Background(), fmt.Sprintf("UPDATE %s SET id = %d WHERE id = %d", h.table, movedTo, movedFrom)).ReadAll()
+		committed <- err
+	}()
+	h.waitFor("the move to be decoded", func() bool {
+		events, _ := h.sink.snapshot()
+		for _, ev := range events {
+			if ev["op"] == "insert" && ev["origin"] == "update" {
+				return true
+			}
+		}
+		return false
+	})
+	if got := h.exec(fmt.Sprintf("SELECT 1 FROM %s WHERE id = %d", h.table, movedTo)); len(got) != 0 {
+		t.Fatal("a query already sees the moved row, the scenario is not set up")
+	}
+	time.Sleep(2 * time.Second)
+
+	h.exec("ALTER SYSTEM RESET synchronous_standby_names")
+	h.exec("SELECT pg_reload_conf()")
+	if err := <-committed; err != nil {
+		t.Fatalf("writer: %v", err)
+	}
+	h.waitFor("backfill to be marked done", func() bool { status, _ := h.backfillStatus(); return status == "done" })
+	stop()
+
+	events, _ := h.sink.snapshot()
+	got, want := replay(events), h.tableState()
+	if !reflect.DeepEqual(got[movedTo], want[movedTo]) {
+		t.Fatalf("moved row differs:\nconsumer %v\ntable    %v", abbreviate(got[movedTo]), abbreviate(want[movedTo]))
+	}
+}
+
+// The tracker overflows while a moved row is still waiting to be read again. The reset must not
+// cost that row its re-read: the scan is past its old key and will never reach its new one.
+func TestBackfillKeepsOwedRereadsAcrossATrackerReset(t *testing.T) {
+	const seeded, movedFrom, movedTo, limit = 2000, 1990, 99999, 40
+	h := newHarness(t, nil)
+	if string(h.exec("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")[0][0]) != "t" {
+		t.Skip("needs a superuser to change synchronous_standby_names")
+	}
+	t.Cleanup(replication.SetTrackedKeysLimit(limit))
+	h.addToastColumn()
+	h.seed(seeded)
+	h.startSession()()
+	backfillOf(1, 1<<20)(&h.cfg)
+	h.cfg.DatabaseURL += "&options=-csynchronous_commit%3Dlocal"
+
+	writer, err := pgconn.Connect(context.Background(), os.Getenv("DATABASE_URL"))
+	if err != nil {
+		t.Fatalf("connect writer: %v", err)
+	}
+	h.exec("ALTER SYSTEM SET synchronous_standby_names = 'walcast_missing_standby'")
+	h.exec("SELECT pg_reload_conf()")
+	t.Cleanup(func() {
+		h.exec("ALTER SYSTEM RESET synchronous_standby_names")
+		h.exec("SELECT pg_reload_conf()")
+		_ = writer.Close(context.Background())
+	})
+	h.waitFor("the standby setting to load", func() bool {
+		return string(h.exec("SHOW synchronous_standby_names")[0][0]) != ""
+	})
+
+	stop := h.startSession()
+	h.waitFor("the scan to be under way", func() bool { return h.reads() >= 5 })
+	committed := make(chan error, 1)
+	go func() {
+		_, err := writer.Exec(context.Background(), fmt.Sprintf("UPDATE %s SET id = %d WHERE id = %d", h.table, movedTo, movedFrom)).ReadAll()
+		committed <- err
+	}()
+	decoded := func(match func(ev map[string]any) bool) func() bool {
+		return func() bool {
+			events, _ := h.sink.snapshot()
+			for _, ev := range events {
+				if match(ev) {
+					return true
+				}
+			}
+			return false
+		}
+	}
+	h.waitFor("the move to be decoded", decoded(func(ev map[string]any) bool { return ev["op"] == "insert" && ev["origin"] == "update" }))
+	// The worker now holds the moved key and waits for the mover to become visible. Touching more
+	// keys than the tracker can hold resets it in exactly that window.
+	time.Sleep(time.Second)
+	h.exec(fmt.Sprintf("SET synchronous_commit = local; UPDATE %s SET name = 'flood' WHERE id BETWEEN 1000 AND %d", h.table, 1000+2*limit))
+	h.waitFor("the flood to be decoded", decoded(func(ev map[string]any) bool {
+		row, _ := ev["new"].(map[string]any)
+		return row["name"] == "flood"
+	}))
+
+	h.exec("ALTER SYSTEM RESET synchronous_standby_names")
+	h.exec("SELECT pg_reload_conf()")
+	if err := <-committed; err != nil {
+		t.Fatalf("writer: %v", err)
+	}
+	h.waitFor("backfill to be marked done", func() bool { status, _ := h.backfillStatus(); return status == "done" })
+	stop()
+
+	events, _ := h.sink.snapshot()
+	got, want := replay(events), h.tableState()
+	if !reflect.DeepEqual(got[movedTo], want[movedTo]) {
+		t.Fatalf("moved row differs:\nconsumer %v\ntable    %v", abbreviate(got[movedTo]), abbreviate(want[movedTo]))
+	}
+	if len(got) != len(want) {
+		t.Fatalf("consumer holds %d rows, table has %d", len(got), len(want))
+	}
+}

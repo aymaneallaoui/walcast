@@ -358,13 +358,11 @@ func (w *backfillWorker) backfill(ctx context.Context, table backfillTable, prog
 	// Key moves that arrived while another table was being copied were parked on this table's
 	// progress row. They are behind the saved cursor or above the upper bound, so they go first.
 	if len(progress.pending) > 0 {
-		emitted, fresh, err := w.deliver(ctx, table, &chunk{generation: w.generation, tableName: table.qualified(), tableOID: table.oid, table: table.desc}, fence, progress.pending)
+		emitted, next, _, err := w.deliver(ctx, table, &chunk{generation: w.generation, tableName: table.qualified(), tableOID: table.oid, table: table.desc}, fence, progress.pending)
 		if err != nil {
 			return err
 		}
-		if fresh != 0 {
-			return fmt.Errorf("key tracker was reset while reading parked keys of %s", table.qualified())
-		}
+		fence = next
 		progress.rows += int64(emitted)
 		if err := clearPendingKeys(ctx, w.conn, w.cfg.StateSchema, w.cfg.SlotName, table); err != nil {
 			return err
@@ -379,12 +377,12 @@ func (w *backfillWorker) backfill(ctx context.Context, table backfillTable, prog
 		// The empty chunk at the end of the scan still goes through the stream: it collects the
 		// key moves seen since the last chunk, which the scan itself will never come back to.
 		finished := len(c.rows) == 0
-		emitted, fresh, err := w.deliver(ctx, table, c, fence, nil)
+		emitted, next, again, err := w.deliver(ctx, table, c, fence, nil)
 		if err != nil {
 			return err
 		}
-		if fresh != 0 {
-			fence = fresh
+		fence = next
+		if again {
 			number--
 			continue
 		}
@@ -403,9 +401,9 @@ func (w *backfillWorker) backfill(ctx context.Context, table backfillTable, prog
 
 // deliver hands a chunk to the stream, then reads again every key that came back unresolved: rows
 // the stream only patched, and key moves. It returns once each of them has been emitted, superseded
-// by a complete stream image, or deleted. A non-zero fence means the tracker was reset and the
-// whole chunk must be read again.
-func (w *backfillWorker) deliver(ctx context.Context, table backfillTable, c *chunk, fence uint64, queue [][]string) (emitted int, fresh uint64, err error) {
+// by a complete stream image, or deleted, with the fence later chunks must use. again means the
+// tracker was reset before the scan chunk itself went through, so the caller reads it once more.
+func (w *backfillWorker) deliver(ctx context.Context, table backfillTable, c *chunk, fence uint64, queue [][]string) (emitted int, next uint64, again bool, err error) {
 	var (
 		batch  = rereadBatch(w.cfg.BackfillChunkRows, len(table.keyColumns))
 		number = c.number
@@ -414,33 +412,50 @@ func (w *backfillWorker) deliver(ctx context.Context, table backfillTable, c *ch
 		c.unresolved = len(queue) > 0
 		w.link.register(c)
 		if err := w.emit(ctx, marker{Kind: markerChunk, Generation: c.generation, Chunk: c.number}); err != nil {
-			return 0, 0, err
+			return 0, 0, false, err
 		}
 		result, err := w.awaitResult(ctx, c)
 		if err != nil {
-			return 0, 0, err
+			return 0, 0, false, err
 		}
 		if result.invalid {
-			w.log.Warn().Str("table", table.qualified()).Msg("backfill: key tracker was reset, reading the chunk again")
-			fresh, err := w.startTracking(ctx, table)
-			return 0, fresh, err
-		}
-		emitted += result.emitted
-		queue = append(queue, result.retry...)
-		for _, move := range result.moves {
-			if move.table != table.qualified() {
-				// Another table's move cannot be read now, its keys are not being tracked. Parking
-				// it durably lets the ack move on instead of holding WAL until that table's turn.
-				if err := w.park(ctx, move); err != nil {
-					return 0, 0, err
+			w.log.Warn().Str("table", table.qualified()).Msg("backfill: key tracker was reset, reading again under a new one")
+			if fence, err = w.startTracking(ctx, table); err != nil {
+				return 0, 0, false, err
+			}
+			if attempt == 0 && len(queue) == 0 {
+				return 0, fence, true, nil
+			}
+			// Keys already owed are not the scan's to find again: they go back on the queue.
+			queue = append(c.keys, queue...)
+		} else {
+			emitted += result.emitted
+			queue = append(queue, result.retry...)
+			moved := false
+			for _, move := range result.moves {
+				if move.table != table.qualified() {
+					// Another table's move cannot be read now, its keys are not being tracked. Parking
+					// it durably lets the ack move on instead of holding WAL until that table's turn.
+					if err := w.park(ctx, move); err != nil {
+						return 0, 0, false, err
+					}
+					continue
 				}
-				continue
+				key, err := keyValues(table.keyColumns, table.qualified(), move.key)
+				if err != nil {
+					return 0, 0, false, err
+				}
+				queue, moved = append(queue, key), true
 			}
-			key, err := keyValues(table.keyColumns, table.qualified(), move.key)
-			if err != nil {
-				return 0, 0, err
+			// A move is decoded before any query can see its row. An xid taken now is above the
+			// mover's, so a snapshot past it shows the row, or proves a later delete took it.
+			if moved {
+				after, err := w.scalar(ctx, "SELECT pg_current_xact_id()::text")
+				if err != nil {
+					return 0, 0, false, fmt.Errorf("take fence xid for a key move: %w", err)
+				}
+				fence = max(fence, after)
 			}
-			queue = append(queue, key)
 		}
 		if attempt > 0 && attempt%50 == 0 {
 			w.log.Warn().Str("table", table.qualified()).Int("keys", len(queue)).Int("attempts", attempt).
@@ -451,20 +466,20 @@ func (w *backfillWorker) deliver(ctx context.Context, table backfillTable, c *ch
 		// the byte budget drop the tail, because a key that silently falls out is a row never sent.
 		for c = nil; c == nil && len(queue) > 0; {
 			n := min(batch, len(queue))
-			next, truncated, err := w.readChunk(ctx, table, number, fence, nil, nil, queue[:n])
+			read, truncated, err := w.readChunk(ctx, table, number, fence, nil, nil, queue[:n])
 			switch {
 			case err != nil:
-				return 0, 0, err
+				return 0, 0, false, err
 			case truncated && n > 1:
 				batch = n / 2
-			case len(next.rows) == 0:
+			case len(read.rows) == 0:
 				queue = queue[n:]
 			default:
-				c, queue = next, queue[n:]
+				c, queue = read, queue[n:]
 			}
 		}
 		if c == nil {
-			return emitted, 0, nil
+			return emitted, fence, false, nil
 		}
 	}
 }
