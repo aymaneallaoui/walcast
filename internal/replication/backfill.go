@@ -32,6 +32,9 @@ const (
 	backfillDone    = "done"
 
 	gatePollInterval = time.Second
+
+	oidJSON  = 114
+	oidJSONB = 3802
 	// A chunk that has not come back by then is abandoned with its session: xid widening assumes a
 	// chunk never lives long enough for the xid counter to move half its range.
 	chunkMaxAge = 10 * time.Minute
@@ -327,6 +330,11 @@ ORDER BY k.ord`, string(row[0]))
 	}
 	if len(keys) == 0 {
 		return refuse("it has no primary key to scan and to key rows by")
+	}
+	for _, c := range table.columns {
+		if c.Key && (c.OID == oidJSON || c.OID == oidJSONB) {
+			return refuse("primary key column %s is json, a key of that type cannot be read back from an event", c.Name)
+		}
 	}
 	for _, k := range keys {
 		table.keyColumns = append(table.keyColumns, string(k[0]))
@@ -736,13 +744,14 @@ func flatten(rows [][][]byte) [][]byte {
 	return out
 }
 
-// keyValues turns a key as the encoder renders it back into the text values a query needs.
+// keyValues turns a key as the encoder renders it back into the text values a query needs. Its
+// errors name the table and column only: a key is row data, and these errors are logged.
 func keyValues(keyColumns []string, table string, encoded []byte) ([]string, error) {
 	var fields map[string]any
 	dec := json.NewDecoder(bytes.NewReader(encoded))
 	dec.UseNumber()
 	if err := dec.Decode(&fields); err != nil {
-		return nil, fmt.Errorf("decode key %s of %s: %w", encoded, table, err)
+		return nil, fmt.Errorf("decode a key of %s: not a json object", table)
 	}
 	values := make([]string, len(keyColumns))
 	for i, column := range keyColumns {
@@ -754,7 +763,7 @@ func keyValues(keyColumns []string, table string, encoded []byte) ([]string, err
 		case bool:
 			values[i] = strconv.FormatBool(v)
 		default:
-			return nil, fmt.Errorf("decode key %s of %s: column %s has no usable value", encoded, table, column)
+			return nil, fmt.Errorf("decode a key of %s: column %s has no usable value", table, column)
 		}
 	}
 	return values, nil

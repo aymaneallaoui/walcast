@@ -251,6 +251,9 @@ func TestBackfillRefusesWhatItCannotDoCorrectly(t *testing.T) {
 		{"no primary key", func(h *harness) {
 			h.exec(fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT %s_pkey", h.table, h.table))
 		}, "no primary key"},
+		{"json primary key", func(h *harness) {
+			h.exec(fmt.Sprintf("ALTER TABLE %[1]s DROP CONSTRAINT %[1]s_pkey, ADD COLUMN doc jsonb NOT NULL DEFAULT '{}', ADD PRIMARY KEY (doc)", h.table))
+		}, "cannot be read back"},
 		{"replica identity full", func(h *harness) {
 			h.exec(fmt.Sprintf("ALTER TABLE %s REPLICA IDENTITY FULL", h.table))
 		}, "replica identity"},
