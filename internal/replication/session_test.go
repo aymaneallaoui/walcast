@@ -13,6 +13,7 @@ import (
 
 	"github.com/aymaneallaoui/walcast/internal/config"
 	"github.com/aymaneallaoui/walcast/internal/event"
+	"github.com/aymaneallaoui/walcast/internal/metrics"
 	"github.com/aymaneallaoui/walcast/internal/sink"
 )
 
@@ -150,7 +151,7 @@ func startSession(t *testing.T, cfg config.Config, st stream, snk sink.Sink) (ca
 	}
 	finished := make(chan outcome, 1)
 	go func() {
-		lsn, err := newSession(cfg, zerolog.Nop(), st).run(ctx, snk)
+		lsn, err := newSession(cfg, zerolog.Nop(), st, metrics.New()).run(ctx, snk)
 		finished <- outcome{lsn, err}
 	}()
 	t.Cleanup(stop)
@@ -169,7 +170,7 @@ func startSession(t *testing.T, cfg config.Config, st stream, snk sink.Sink) (ca
 
 func TestSession_handleXLogData(t *testing.T) {
 	t.Run("commit on a dirty batch sets its ack", func(t *testing.T) {
-		s := newSession(testConfig(), zerolog.Nop(), newFakeStream())
+		s := newSession(testConfig(), zerolog.Nop(), newFakeStream(), metrics.New())
 		for _, payload := range [][]byte{relationMsg(), beginMsg(90, 7), insertMsg("1", "a"), commitMsg(90, 100)} {
 			if err := s.handleXLogData(xlogData(50, payload).Data[1:]); err != nil {
 				t.Fatal(err)
@@ -183,7 +184,7 @@ func TestSession_handleXLogData(t *testing.T) {
 	t.Run("fragment sealed inside a transaction carries no ack", func(t *testing.T) {
 		cfg := testConfig()
 		cfg.BatchMaxBytes = 1
-		s := newSession(cfg, zerolog.Nop(), newFakeStream())
+		s := newSession(cfg, zerolog.Nop(), newFakeStream(), metrics.New())
 		for _, payload := range [][]byte{relationMsg(), beginMsg(90, 7), insertMsg("1", "a")} {
 			if err := s.handleXLogData(xlogData(50, payload).Data[1:]); err != nil {
 				t.Fatal(err)
@@ -198,7 +199,7 @@ func TestSession_handleXLogData(t *testing.T) {
 	})
 
 	t.Run("empty transaction advances the idle ledger directly", func(t *testing.T) {
-		s := newSession(testConfig(), zerolog.Nop(), newFakeStream())
+		s := newSession(testConfig(), zerolog.Nop(), newFakeStream(), metrics.New())
 		for _, payload := range [][]byte{beginMsg(90, 7), commitMsg(90, 100)} {
 			if err := s.handleXLogData(xlogData(50, payload).Data[1:]); err != nil {
 				t.Fatal(err)
@@ -210,7 +211,7 @@ func TestSession_handleXLogData(t *testing.T) {
 	})
 
 	t.Run("empty transaction behind in-flight work rides a batch instead", func(t *testing.T) {
-		s := newSession(testConfig(), zerolog.Nop(), newFakeStream())
+		s := newSession(testConfig(), zerolog.Nop(), newFakeStream(), metrics.New())
 		s.ledger.Add(80, 1)
 		for _, payload := range [][]byte{beginMsg(90, 7), commitMsg(90, 100)} {
 			if err := s.handleXLogData(xlogData(50, payload).Data[1:]); err != nil {
@@ -223,7 +224,7 @@ func TestSession_handleXLogData(t *testing.T) {
 	})
 
 	t.Run("commit that emitted nothing leaves no commit time behind", func(t *testing.T) {
-		s := newSession(testConfig(), zerolog.Nop(), newFakeStream())
+		s := newSession(testConfig(), zerolog.Nop(), newFakeStream(), metrics.New())
 		for _, payload := range [][]byte{beginMsg(90, 7), commitMsg(90, 100)} {
 			if err := s.handleXLogData(xlogData(50, payload).Data[1:]); err != nil {
 				t.Fatal(err)
@@ -243,7 +244,7 @@ func TestSession_handleXLogData(t *testing.T) {
 	})
 
 	t.Run("change for an unknown relation is unencodable", func(t *testing.T) {
-		s := newSession(testConfig(), zerolog.Nop(), newFakeStream())
+		s := newSession(testConfig(), zerolog.Nop(), newFakeStream(), metrics.New())
 		err := s.handleXLogData(xlogData(50, insertMsg("1", "a")).Data[1:])
 		if !errors.Is(err, event.ErrUnencodable) {
 			t.Fatalf("err = %v, want ErrUnencodable", err)
@@ -252,7 +253,7 @@ func TestSession_handleXLogData(t *testing.T) {
 }
 
 func TestSession_observeDelivery(t *testing.T) {
-	s := newSession(testConfig(), zerolog.Nop(), newFakeStream())
+	s := newSession(testConfig(), zerolog.Nop(), newFakeStream(), metrics.New())
 	for _, payload := range [][]byte{relationMsg(), beginMsg(90, 7), insertMsg("1", "a"), insertMsg("2", "b"), commitMsg(90, 100)} {
 		if err := s.handleXLogData(xlogData(50, payload).Data[1:]); err != nil {
 			t.Fatal(err)
@@ -273,9 +274,38 @@ func TestSession_observeDelivery(t *testing.T) {
 	}
 }
 
+func TestSession_positionGauges(t *testing.T) {
+	t.Run("received never moves back", func(t *testing.T) {
+		s := newSession(testConfig(), zerolog.Nop(), newFakeStream(), metrics.New())
+		s.publishReceived(200)
+		s.publishReceived(100)
+		if got := s.received.Load(); got != 200 {
+			t.Fatalf("received = %d, want 200", got)
+		}
+	})
+
+	t.Run("reported is what was sent, not what could be", func(t *testing.T) {
+		s := newSession(testConfig(), zerolog.Nop(), newFakeStream(), metrics.New())
+		for _, payload := range [][]byte{beginMsg(90, 7), commitMsg(90, 100)} {
+			if err := s.handleXLogData(xlogData(50, payload).Data[1:]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if s.ledger.Flushed() != 100 || s.reported.Load() != 0 {
+			t.Fatalf("before feedback: flushed=%s reported=%d", s.ledger.Flushed(), s.reported.Load())
+		}
+		if err := s.sendStatus(); err != nil {
+			t.Fatal(err)
+		}
+		if got := s.reported.Load(); got != 100 {
+			t.Fatalf("reported = %d, want 100", got)
+		}
+	})
+}
+
 func TestSession_handleKeepalive(t *testing.T) {
 	t.Run("advances only outside a transaction with a clean batch", func(t *testing.T) {
-		s := newSession(testConfig(), zerolog.Nop(), newFakeStream())
+		s := newSession(testConfig(), zerolog.Nop(), newFakeStream(), metrics.New())
 		s.inTx = true
 		if err := s.handleKeepalive(keepalive(500, false).Data[1:]); err != nil {
 			t.Fatal(err)
@@ -294,7 +324,7 @@ func TestSession_handleKeepalive(t *testing.T) {
 	})
 
 	t.Run("reply request forces immediate feedback", func(t *testing.T) {
-		s := newSession(testConfig(), zerolog.Nop(), newFakeStream())
+		s := newSession(testConfig(), zerolog.Nop(), newFakeStream(), metrics.New())
 		if err := s.handleKeepalive(keepalive(1, true).Data[1:]); err != nil {
 			t.Fatal(err)
 		}
@@ -388,7 +418,7 @@ func TestSession_run(t *testing.T) {
 		st := newFakeStream(committedInsert()...)
 		ctx, cancel := context.WithCancel(context.Background())
 		t.Cleanup(cancel)
-		sess := newSession(testConfig(), zerolog.Nop(), st)
+		sess := newSession(testConfig(), zerolog.Nop(), st, metrics.New())
 		finished := make(chan error, 1)
 		go func() {
 			_, err := sess.run(ctx, snk)
@@ -455,7 +485,7 @@ func TestSession_run(t *testing.T) {
 func BenchmarkSession_handleXLogData(b *testing.B) {
 	cfg := testConfig()
 	cfg.BatchMaxBytes = 1 << 30
-	s := newSession(cfg, zerolog.Nop(), newFakeStream())
+	s := newSession(cfg, zerolog.Nop(), newFakeStream(), metrics.New())
 	for _, payload := range [][]byte{relationMsg(), beginMsg(90, 7)} {
 		if err := s.handleXLogData(xlogData(50, payload).Data[1:]); err != nil {
 			b.Fatal(err)
@@ -513,7 +543,7 @@ func TestSession_stalledSinkIsNotServerSilence(t *testing.T) {
 	defer stop()
 	finished := make(chan error, 1)
 	go func() {
-		_, err := newSession(cfg, zerolog.Nop(), st).run(ctx, snk)
+		_, err := newSession(cfg, zerolog.Nop(), st, metrics.New()).run(ctx, snk)
 		finished <- err
 	}()
 	eventually(t, "the first batch to reach the sink", func() bool { return snk.held() == 1 })
