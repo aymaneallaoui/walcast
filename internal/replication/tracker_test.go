@@ -58,6 +58,8 @@ func TestTrackerVerdict(t *testing.T) {
 		{name: "complete image followed by a patch is a baseline", changes: []observed{{change(event.OpInsert, false), 745}, {change(event.OpUpdate, true), 750}}, want: rowDrop},
 		{name: "patch followed by a complete image is a baseline", changes: []observed{{change(event.OpUpdate, true), 745}, {change(event.OpUpdate, false), 750}}, want: rowDrop},
 		{name: "two patches are still no baseline", changes: []observed{{change(event.OpUpdate, true), 745}, {change(event.OpUpdate, true), 750}}, want: rowRetry},
+		{name: "a row moved onto a deleted key has no baseline from the row that was there", changes: []observed{{change(event.OpDelete, false), 745}, {change(event.OpInsert, true), 750}}, want: rowRetry},
+		{name: "a row moved onto a key does not inherit the old occupant's image", changes: []observed{{change(event.OpInsert, false), 745}, {change(event.OpDelete, false), 746}, {change(event.OpInsert, true), 750}}, want: rowRetry},
 		{name: "invisible truncate drops every row", changes: []observed{{change(event.OpTruncate, false), 750}}, want: rowDrop},
 		{name: "truncate the snapshot saw is irrelevant", changes: []observed{{change(event.OpTruncate, false), 700}}, want: rowEmit},
 	}

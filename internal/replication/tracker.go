@@ -61,8 +61,10 @@ func (t *tracker) observe(rec event.Record, key []byte, xid uint32) {
 		t.keys = nil
 		return
 	}
-	// One complete image inside the window is enough of a baseline for every later patch.
-	t.keys[string(key)] = trackedKey{xid: wide, partial: rec.Partial && (!seen || prev.partial)}
+	// One complete image inside the window is a baseline for every later patch of that row. An
+	// insert is another row, moved onto the key, and takes nothing from the one that was there.
+	inherits := seen && !prev.partial && rec.Op == event.OpUpdate
+	t.keys[string(key)] = trackedKey{xid: wide, partial: rec.Partial && !inherits}
 }
 
 // verdict decides what happens to a chunk row read under a snapshot with the given xmin. Every
