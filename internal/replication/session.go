@@ -254,6 +254,8 @@ type keyMove struct {
 type awaitedChunk struct {
 	result chunkResult
 	lsn    pglogrepl.LSN
+	// unresolved keeps the hold: the worker still owes re-reads that this chunk says nothing about.
+	unresolved bool
 }
 
 func newSession(cfg config.Config, log zerolog.Logger, st stream, m *metrics.Metrics) *session {
@@ -622,7 +624,7 @@ func (s *session) emitReads() error {
 	}
 	s.tracker.prune(r.chunk.xmin)
 	s.metrics.BackfillChunks.Inc()
-	s.awaited = &awaitedChunk{lsn: r.lsn, result: chunkResult{
+	s.awaited = &awaitedChunk{lsn: r.lsn, unresolved: r.chunk.unresolved, result: chunkResult{
 		generation: r.chunk.generation, number: r.chunk.number, emitted: r.emitted, retry: r.retry,
 		moves: s.takeKeyMoves(),
 	}}
@@ -649,7 +651,7 @@ func (s *session) reportChunk() {
 	case s.link.results <- a.result:
 		s.awaited = nil
 		// A chunk that came back clean, with no key move seen since, leaves nothing to replay for.
-		if !a.result.invalid && len(a.result.retry) == 0 && len(a.result.moves) == 0 && len(s.keyMoves) == 0 {
+		if !a.result.invalid && !a.unresolved && len(a.result.retry) == 0 && len(a.result.moves) == 0 && len(s.keyMoves) == 0 {
 			s.ledger.Release()
 		}
 	default:

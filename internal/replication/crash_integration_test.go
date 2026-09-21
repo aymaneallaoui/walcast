@@ -408,6 +408,8 @@ type stallingLog struct {
 	eventLog
 	armed   atomic.Bool
 	stalled atomic.Bool
+	// trigger picks the event after whose batch every later request stalls; nil means a key move.
+	trigger func(ev map[string]any) bool
 	moved   chan struct{}
 	release chan struct{}
 }
@@ -422,7 +424,11 @@ func (l *stallingLog) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	l.eventLog.ServeHTTP(w, req)
 	// Armed once: after the restart the move is replayed, and stalling again would block it forever.
 	for _, ev := range l.snapshot()[before:] {
-		if ev["op"] == "insert" && ev["origin"] == "update" && l.armed.CompareAndSwap(true, false) {
+		hit := ev["op"] == "insert" && ev["origin"] == "update"
+		if l.trigger != nil {
+			hit = l.trigger(ev)
+		}
+		if hit && l.armed.CompareAndSwap(true, false) {
 			l.stalled.Store(true)
 			close(l.moved)
 		}
@@ -488,6 +494,77 @@ func TestKillNineAfterAnAckedKeyMoveStillDeliversTheRow(t *testing.T) {
 	if !reflect.DeepEqual(got[movedTo], want[movedTo]) {
 		t.Fatalf("moved row differs:\nconsumer %v\ntable    %v\nhistory:\n%s",
 			abbreviate(got[movedTo]), abbreviate(want[movedTo]), history(events, movedTo))
+	}
+	if len(got) != len(want) {
+		t.Fatalf("consumer holds %d rows, table has %d", len(got), len(want))
+	}
+}
+
+// Two rows move in one transaction and are read again one at a time. The first re-read coming back
+// clean says nothing about the second, so the ack has to stay before the move until both are done.
+func TestKillNineBetweenTwoRereadsStillDeliversTheSecondRow(t *testing.T) {
+	const seeded, firstTo, secondTo = 400, 9990, 9991
+	h := newHarness(t, nil)
+	h.addToastColumn()
+	h.seed(seeded)
+	bin := buildWalcast(t)
+	log := &stallingLog{moved: make(chan struct{}), release: make(chan struct{})}
+	log.trigger = func(ev map[string]any) bool {
+		row, _ := ev["new"].(map[string]any)
+		return ev["op"] == "read" && row["id"] == float64(firstTo)
+	}
+	log.armed.Store(true)
+	srv := httptest.NewServer(log)
+	t.Cleanup(srv.Close)
+	stderr, err := os.Create(filepath.Join(t.TempDir(), "walcast.stderr"))
+	if err != nil {
+		t.Fatalf("create stderr file: %v", err)
+	}
+	t.Cleanup(func() {
+		if out, readErr := os.ReadFile(stderr.Name()); t.Failed() && readErr == nil {
+			t.Logf("walcast stderr:\n%s", out)
+		}
+		_ = stderr.Close()
+	})
+	env := []string{"BACKFILL_TABLES=public." + h.table, "BACKFILL_CHUNK_ROWS=1"}
+
+	proc := h.startProcess(bin, srv.URL, stderr, env...)
+	h.waitFor("the first chunks", func() bool {
+		return log.count(func(ev map[string]any) bool { return ev["op"] == "read" }) >= 20
+	})
+	h.exec(fmt.Sprintf("UPDATE %s SET id = id + 9600 WHERE id IN (390, 391)", h.table))
+
+	select {
+	case <-log.moved:
+	case <-time.After(waitTimeout):
+		t.Fatal("the first moved row was never read again")
+	}
+	time.Sleep(500 * time.Millisecond)
+	if err := proc.Process.Signal(syscall.SIGKILL); err != nil {
+		t.Fatalf("kill -9: %v", err)
+	}
+	_ = proc.Wait()
+	log.stalled.Store(false)
+	close(log.release)
+
+	h.startProcess(bin, srv.URL, stderr, env...)
+	h.waitFor("backfill to be marked done", func() bool { status, _ := h.backfillStatus(); return status == "done" })
+	const sentinel = 9_000_000
+	h.exec(fmt.Sprintf("INSERT INTO %s VALUES (%d, 'sentinel', true, NULL)", h.table, sentinel))
+	h.waitFor("the sentinel", func() bool {
+		return log.count(func(ev map[string]any) bool {
+			row, _ := ev["new"].(map[string]any)
+			return row["id"] == float64(sentinel)
+		}) > 0
+	})
+
+	events := log.snapshot()
+	got, want := replay(dedupe(events)), h.tableState()
+	for _, id := range []float64{firstTo, secondTo} {
+		if !reflect.DeepEqual(got[id], want[id]) {
+			t.Fatalf("moved row %v differs:\nconsumer %v\ntable    %v\nhistory:\n%s",
+				id, abbreviate(got[id]), abbreviate(want[id]), history(events, id))
+		}
 	}
 	if len(got) != len(want) {
 		t.Fatalf("consumer holds %d rows, table has %d", len(got), len(want))

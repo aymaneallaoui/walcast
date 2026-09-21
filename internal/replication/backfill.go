@@ -64,6 +64,8 @@ type chunk struct {
 	rows       [][][]byte
 	keys       [][]string
 	last       []string
+	// unresolved is set while the worker still holds keys to read again after this chunk.
+	unresolved bool
 }
 
 type chunkResult struct {
@@ -409,6 +411,7 @@ func (w *backfillWorker) deliver(ctx context.Context, table backfillTable, c *ch
 		number = c.number
 	)
 	for attempt := 0; ; attempt++ {
+		c.unresolved = len(queue) > 0
 		w.link.register(c)
 		if err := w.emit(ctx, marker{Kind: markerChunk, Generation: c.generation, Chunk: c.number}); err != nil {
 			return 0, 0, err
