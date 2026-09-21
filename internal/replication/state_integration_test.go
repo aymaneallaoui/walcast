@@ -235,3 +235,18 @@ INSERT INTO %[1]s.backfills (table_name, table_oid, slot_generation, status) VAL
 	}
 	h.exec(fmt.Sprintf("INSERT INTO %s.backfills (slot_name, table_name, table_oid, slot_generation, status) VALUES ('second_slot', 'public.users', 1, 0, 'running')", schema))
 }
+
+// Two processes can start on the same lost slot with the same override. Only one of them may use
+// it: the other would recreate the slot a second time on an authorisation that was given once.
+func TestRecreateGenerationIsSpentOnlyOnce(t *testing.T) {
+	h := newHarness(t, nil)
+	h.startSession()()
+	ctx := context.Background()
+	if err := replication.SpendGeneration(ctx, h.cfg.DatabaseURL, h.cfg.StateSchema, h.cfg.SlotName, 1); err != nil {
+		t.Fatalf("first use of generation 1: %v", err)
+	}
+	err := replication.SpendGeneration(ctx, h.cfg.DatabaseURL, h.cfg.StateSchema, h.cfg.SlotName, 1)
+	if !errors.Is(err, replication.ErrSlotLost) {
+		t.Fatalf("second use of generation 1 returned %v, want it refused", err)
+	}
+}

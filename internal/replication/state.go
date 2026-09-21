@@ -92,16 +92,21 @@ func recordSlot(ctx context.Context, conn *pgconn.PgConn, schema, slot string) e
 	return nil
 }
 
-// spendGeneration makes a SLOT_RECREATE_GENERATION value unusable for any later start.
+// spendGeneration makes a SLOT_RECREATE_GENERATION value unusable for any later start. It only
+// moves the stored generation forward by one, so of two processes using one value a single one wins.
 func spendGeneration(ctx context.Context, conn *pgconn.PgConn, schema, slot string, generation int, recreated bool) error {
 	stamp := ""
 	if recreated {
 		stamp = ", recreated_at = now()"
 	}
-	_, err := query(ctx, conn, fmt.Sprintf(
-		"UPDATE %s.%s SET generation = %d%s WHERE slot_name = '%s'", schema, stateTable, generation, stamp, slot))
+	rows, err := query(ctx, conn, fmt.Sprintf(
+		"UPDATE %s.%s SET generation = %d%s WHERE slot_name = '%s' AND generation = %d RETURNING generation",
+		schema, stateTable, generation, stamp, slot, generation-1))
 	if err != nil {
 		return stateError("record slot generation", err)
+	}
+	if len(rows) != 1 {
+		return fmt.Errorf("%w: SLOT_RECREATE_GENERATION=%d was already used for %s, by another process or an earlier start", ErrSlotLost, generation, slot)
 	}
 	return nil
 }
