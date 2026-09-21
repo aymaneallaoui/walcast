@@ -2,7 +2,6 @@ package metrics
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -12,11 +11,18 @@ import (
 	"github.com/rs/zerolog"
 )
 
-const (
-	readHeaderTimeout = 5 * time.Second
-	idleTimeout       = time.Minute
-	shutdownTimeout   = 5 * time.Second
-)
+type limits struct {
+	readHeader, read, write, idle, shutdown time.Duration
+}
+
+// The write limit covers a scrape only: a CPU profile or a trace writes for as long as it was asked to.
+var defaultLimits = limits{
+	readHeader: 5 * time.Second,
+	read:       10 * time.Second,
+	write:      10 * time.Second,
+	idle:       time.Minute,
+	shutdown:   5 * time.Second,
+}
 
 // Listen binds before anything else starts, so a bad or busy address stops the process at startup
 // instead of leaving it running without the metrics its operator asked for.
@@ -31,8 +37,13 @@ func Listen(addr string) (net.Listener, error) {
 // Serve runs until ctx is cancelled. It uses its own mux: importing net/http/pprof registers the
 // profiling handlers on http.DefaultServeMux as a side effect, and that mux is never served here.
 func Serve(ctx context.Context, ln net.Listener, m *Metrics, withPprof bool, log zerolog.Logger) error {
+	return serve(ctx, ln, m, withPprof, log, defaultLimits)
+}
+
+func serve(ctx context.Context, ln net.Listener, m *Metrics, withPprof bool, log zerolog.Logger, l limits) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) {
+		_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(l.write))
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		m.Write(w)
 	})
@@ -48,7 +59,7 @@ func Serve(ctx context.Context, ln net.Listener, m *Metrics, withPprof bool, log
 	}
 	log.Info().Stringer("addr", ln.Addr()).Bool("pprof", withPprof).Msg("metrics listening")
 
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: readHeaderTimeout, IdleTimeout: idleTimeout}
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: l.readHeader, ReadTimeout: l.read, IdleTimeout: l.idle}
 	failed := make(chan error, 1)
 	go func() { failed <- srv.Serve(ln) }()
 
@@ -57,10 +68,11 @@ func Serve(ctx context.Context, ln net.Listener, m *Metrics, withPprof bool, log
 		return fmt.Errorf("metrics: serve: %w", err)
 	case <-ctx.Done():
 	}
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), l.shutdown)
 	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return fmt.Errorf("metrics: shutdown: %w", err)
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		// A connection that would not finish in time is cut, the process is stopping anyway.
+		_ = srv.Close()
 	}
 	<-failed
 	return nil
