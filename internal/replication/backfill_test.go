@@ -322,3 +322,24 @@ func TestSession_keyMovesOfOtherTablesReachTheWorker(t *testing.T) {
 		t.Fatalf("moves = %+v, want the other table's key move kept for the worker to park", moves)
 	}
 }
+
+func TestRereadBatch(t *testing.T) {
+	tests := []struct {
+		name             string
+		rows, keyColumns int
+		want             int
+	}{
+		{"small chunk is untouched", 500, 1, 500},
+		{"default chunk with a wide key fits the bind limit", 10000, 7, 9362},
+		{"huge chunk with one key column", 100000, 1, 65535},
+		{"never below one key", 10, 70000, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := rereadBatch(tt.rows, tt.keyColumns)
+			if got != tt.want || got*tt.keyColumns > maxQueryParams && got > 1 {
+				t.Fatalf("rereadBatch(%d, %d) = %d, want %d", tt.rows, tt.keyColumns, got, tt.want)
+			}
+		})
+	}
+}
