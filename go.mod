@@ -3,15 +3,15 @@ module github.com/aymaneallaoui/walcast
 go 1.27.1
 
 require (
-	github.com/VictoriaMetrics/metrics v1.44.0
-	github.com/caarlos0/env/v11 v11.4.1
+	github.com/VictoriaMetrics/metrics v1.45.0
+	github.com/caarlos0/env/v11 v11.4.2
 	github.com/jackc/pglogrepl v0.0.0-20260824121319-4ae5c490f7ce
-	github.com/jackc/pgx/v5 v5.11.0
+	github.com/jackc/pgx/v5 v5.12.0
 	github.com/joho/godotenv v1.5.1
 	github.com/rs/zerolog v1.35.1
 	github.com/testcontainers/testcontainers-go v0.44.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.44.0
-	github.com/twmb/franz-go v1.22.0
+	github.com/twmb/franz-go v1.22.2
 	github.com/twmb/franz-go/pkg/kfake v0.0.0-20260918165059-79db0ce448c6
 	go.uber.org/goleak v1.3.0
 )
@@ -40,7 +40,7 @@ require (
 	github.com/jackc/pgio v1.0.0 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
-	github.com/klauspost/compress v1.20.0 // indirect
+	github.com/klauspost/compress v1.20.3 // indirect
 	github.com/lufia/plan9stats v0.0.0-20260330125221-c963978e514e // indirect
 	github.com/magiconair/properties v1.8.10 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
@@ -56,7 +56,7 @@ require (
 	github.com/moby/term v0.5.2 // indirect
 	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/opencontainers/image-spec v1.1.1 // indirect
-	github.com/pierrec/lz4/v4 v4.1.30 // indirect
+	github.com/pierrec/lz4/v4 v4.1.33 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
 	github.com/shirou/gopsutil/v4 v4.26.6 // indirect
@@ -64,7 +64,7 @@ require (
 	github.com/stretchr/testify v1.11.1 // indirect
 	github.com/tklauser/go-sysconf v0.4.0 // indirect
 	github.com/tklauser/numcpus v0.12.0 // indirect
-	github.com/twmb/franz-go/pkg/kmsg v1.14.0 // indirect
+	github.com/twmb/franz-go/pkg/kmsg v1.15.0 // indirect
 	github.com/valyala/fastrand v1.1.0 // indirect
 	github.com/valyala/histogram v1.2.0 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
